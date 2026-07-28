@@ -1,3 +1,9 @@
+# Railway deployment: set these five variables under the service's "Variables" tab (Railway injects them as
+# environment variables at runtime, so no .env file is deployed — .env is local-development only and gitignored):
+#   TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, SUPABASE_URL, SUPABASE_ANON_KEY
+# OPENAI_API_KEY is used only to transcribe Telegram voice notes via the Whisper API; without it the bot still
+# starts but refuses to boot (it is in REQUIRED_ENV_VARS below) — remove it from that list to run text-only.
+
 import difflib  # standard library module used for typo-tolerant fuzzy text matching
 import json  # standard library module used to parse and serialize JSON data
 import logging  # standard library module used to log bot activity and errors
@@ -9,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone  # date/time utilities 
 from zoneinfo import ZoneInfo  # IANA timezone database lookup, used to resolve "today" in the vendor's local time
 
 import anthropic  # official Anthropic SDK used to call the Claude API
+import openai  # official OpenAI SDK, used only for Whisper speech-to-text on voice notes
 from dotenv import load_dotenv  # loads variables from the local .env file into the environment
 from supabase import create_client, Client  # Supabase client used to read and write the transactions table
 from telegram import Update  # Telegram type representing an incoming update (e.g. a message)
@@ -16,7 +23,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()  # populate os.environ with the values defined in .env, if one exists (e.g. local dev, not on Railway)
 
-REQUIRED_ENV_VARS = ["TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "SUPABASE_URL", "SUPABASE_ANON_KEY"]  # must all be set
+REQUIRED_ENV_VARS = [  # must all be set, or the bot exits at startup with a clear message
+    "TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_ANON_KEY",
+]
 missing_env_vars = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]  # which ones, if any, are missing
 if missing_env_vars:  # fail fast with a clear message rather than a KeyError traceback deep in some other call
     print(f"Missing required environment variable(s): {', '.join(missing_env_vars)}")
@@ -26,6 +35,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # Telegram bot token 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")  # Supabase project REST URL
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")  # Supabase anon API key
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Anthropic API key used to call Claude
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # OpenAI API key used to transcribe voice notes via Whisper
 
 logging.basicConfig(  # configure the root logger for the whole process
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",  # log line format: timestamp, logger name, level, message
@@ -35,8 +45,12 @@ logger = logging.getLogger(__name__)  # module-level logger used throughout this
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)  # Supabase client instance used for all database ops
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)  # Anthropic client instance used for all Claude API calls
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)  # OpenAI client instance, used only for Whisper transcription
 
 CLAUDE_MODEL = "claude-sonnet-4-6"  # Claude model used to classify every incoming message
+WHISPER_MODEL = "whisper-1"  # OpenAI speech-to-text model used to transcribe Telegram voice notes
+
+VOICE_TRANSCRIPTION_ERROR = "No pude entender la nota de voz. ¿Puedes escribirlo?"  # shown when transcription fails
 
 LOCAL_TZ = ZoneInfo("Europe/Amsterdam")  # the vendor's local timezone, used to resolve "today" for reports
 
@@ -1506,18 +1520,9 @@ async def handle_state_r_debtors_followup(message, user_id: int, text: str, stat
         await handle_state_a(message, user_id, text)  # classify and handle this message normally
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # entry point for every message
-    message = update.message  # the incoming Telegram message object
-    if message is None or message.text is None:  # ignore updates that are not plain text messages
-        return  # nothing to do
-
-    dedup_key = (message.chat_id, message.message_id)  # unique identifier for this exact Telegram message
-    if not mark_message_processed(dedup_key):  # this message was already processed (duplicate delivery)
-        logger.info("Skipping duplicate message_id %s in chat %s", message.message_id, message.chat_id)  # log it
-        return  # skip silently: no reply, no Supabase writes, no state change
-
-    user_id = message.from_user.id  # Telegram user ID, used as the conversation-state key
-    text = message.text.strip()  # the message text with surrounding whitespace removed
+async def process_text(message, user_id: int, text: str) -> None:  # dispatch already-extracted text to its state
+    # handler. Typed messages and transcribed voice notes both land here, so a voice note is treated exactly like
+    # the same words typed — including mid-flow replies ("sí" in State D confirms, it does not start a new transaction).
     state_info = user_states.get(user_id, {"state": "A"})  # look up this user's state, defaulting to State A
     state = state_info.get("state", "A")  # extract the state name, defaulting to State A
 
@@ -1558,6 +1563,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("Hubo un error al procesar tu mensaje. Intenta de nuevo.")  # tell the user
 
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # entry point for text messages
+    message = update.message  # the incoming Telegram message object
+    if message is None or message.text is None:  # ignore updates that are not plain text messages
+        return  # nothing to do
+
+    dedup_key = (message.chat_id, message.message_id)  # unique identifier for this exact Telegram message
+    if not mark_message_processed(dedup_key):  # this message was already processed (duplicate delivery)
+        logger.info("Skipping duplicate message_id %s in chat %s", message.message_id, message.chat_id)  # log it
+        return  # skip silently: no reply, no Supabase writes, no state change
+
+    await process_text(message, message.from_user.id, message.text.strip())  # dispatch to the state machine
+
+
+def transcribe_voice(audio_bytes: bytes) -> str | None:  # send Telegram's .ogg voice note to Whisper, return the text
+    # Whisper accepts .ogg/opus directly, so no ffmpeg conversion is needed — the bytes go up exactly as downloaded.
+    try:  # a transcription failure must never crash the handler; the caller asks the user to type instead
+        transcription = openai_client.audio.transcriptions.create(
+            model=WHISPER_MODEL,  # OpenAI's speech-to-text model
+            file=("voice.ogg", audio_bytes, "audio/ogg"),  # (filename, bytes, MIME type) tuple the SDK expects
+            language="es",  # the vendor speaks Spanish; naming it improves accuracy and avoids language drift
+        )
+    except Exception:  # network error, bad API key, unsupported audio, empty file, quota exhausted, ...
+        logger.exception("Whisper transcription failed")  # log the full traceback for debugging
+        return None  # signal failure to the caller
+
+    text = (transcription.text or "").strip()  # the transcribed text, or an empty string if Whisper heard nothing
+    return text or None  # treat a blank transcription (silence, pure noise) as a failure too
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # entry point for voice notes
+    message = update.message  # the incoming Telegram message object
+    if message is None or message.voice is None:  # ignore updates that are not voice messages
+        return  # nothing to do
+
+    dedup_key = (message.chat_id, message.message_id)  # unique identifier for this exact Telegram message
+    if not mark_message_processed(dedup_key):  # this message was already processed (duplicate delivery)
+        logger.info("Skipping duplicate voice message_id %s in chat %s", message.message_id, message.chat_id)
+        return  # skip silently: no reply, no Supabase writes, no state change
+
+    user_id = message.from_user.id  # Telegram user ID, used as the conversation-state key
+
+    try:  # downloading from Telegram can fail independently of transcription
+        voice_file = await context.bot.get_file(message.voice.file_id)  # resolve the file ID to a downloadable file
+        audio_buffer = await voice_file.download_as_bytearray()  # pull the .ogg bytes into memory, no temp file needed
+    except Exception:  # network error, expired file ID, Telegram outage, ...
+        logger.exception("Failed to download voice note")  # log the full traceback for debugging
+        await message.reply_text(VOICE_TRANSCRIPTION_ERROR)  # ask the user to type it instead
+        return  # stop here, leaving the user's state untouched (State A stays State A)
+
+    text = transcribe_voice(bytes(audio_buffer))  # convert the audio to text via Whisper
+    if text is None:  # transcription failed or produced nothing usable
+        user_states.pop(user_id, None)  # return this user to State A, as specified
+        await message.reply_text(VOICE_TRANSCRIPTION_ERROR)  # ask the user to type it instead
+        return  # stop here
+
+    logger.info("Voice note from user %s transcribed as: %r", user_id, text)  # surface the transcription in the log
+    await process_text(message, user_id, text)  # hand off to the same dispatch a typed message would take
+
+
 EXAMPLES_MESSAGE = (  # sent right after the welcome message, showing the range of things the bot understands
     "Aquí tienes ejemplos de lo que puedes escribirme:\n\n"
     "📝 Registrar una transacción:\n"
@@ -1589,6 +1653,7 @@ def main() -> None:  # build and run the Telegram bot
     application.add_handler(  # register the handler for incoming text messages
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)  # match any text message that isn't a command
     )
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))  # transcribe and handle voice notes
     application.run_polling()  # start polling Telegram for updates until interrupted
 
 
