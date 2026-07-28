@@ -10,6 +10,7 @@ import logging  # standard library module used to log bot activity and errors
 import os  # standard library module used to read environment variables
 import re  # standard library module used for regular expression matching
 import sys  # standard library module used to exit cleanly on a missing configuration
+import unicodedata  # standard library module used to strip accents when matching user replies
 from collections import deque  # fixed-size queue used to remember recently processed message IDs
 from datetime import date, datetime, timedelta, timezone  # date/time utilities for date-range parsing and timestamps
 from zoneinfo import ZoneInfo  # IANA timezone database lookup, used to resolve "today" in the vendor's local time
@@ -147,8 +148,21 @@ Rules:
 # ^ System prompt text sent to Claude on every classification call. The lines inside the string above
 # are prompt content, not Python code, so they are not individually annotated with trailing comments.
 
-CANCELLATION_KEYWORDS = ["olvidalo", "olvídalo", "no importa", "cancela", "borra eso"]  # phrases meaning "cancel"
-AFFIRMATIVE_REPLIES = {"si", "sí", "s", "yes", "correcto", "esa es", "esa"}  # normalized replies treated as "yes"
+def strip_accents(text: str) -> str:  # drop diacritics so "sí"/"si" and "descripción"/"descripcion" compare equal
+    decomposed = unicodedata.normalize("NFKD", text)  # split each accented character into base letter + accent mark
+    return "".join(char for char in decomposed if not unicodedata.combining(char))  # keep only the base letters
+
+
+def normalize_reply(text: str) -> str:  # canonical form for every user reply compared against an expected word
+    return strip_accents(text.strip().lower())  # trim, lowercase, and de-accent so "SÍ", "Sí", "si" all match
+
+
+# Every collection below is compared against a normalize_reply() result, so its LOOKUP KEYS are stored de-accented.
+# Dictionary VALUES are the canonical values written to Supabase and must keep their accents ("única vez").
+CANCELLATION_KEYWORDS = [  # phrases meaning "cancel" (accent-free: "olvídalo" normalizes to "olvidalo")
+    "olvidalo", "no importa", "cancela", "borra eso",
+]
+AFFIRMATIVE_REPLIES = {"si", "s", "yes", "correcto", "esa es", "esa"}  # normalized replies treated as "yes"
 NEGATIVE_REPLIES = {"no", "ese no", "esa no", "no es"}  # normalized replies treated as "no"
 AMOUNT_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")  # regex matching a plain numeric string (optional sign and decimals)
 
@@ -173,7 +187,7 @@ NEW_VALUE_PROMPT = (  # fully numbered menu of every field the user can correct
 
 FIELD_MENU = {  # numbered/word options that need a follow-up question before a value is known
     "1": "amount", "monto": "amount", "valor": "amount",
-    "2": "description", "descripcion": "description", "descripción": "description",
+    "2": "description", "descripcion": "description",  # "descripción" normalizes to this same de-accented key
 }
 
 VALUE_MENU = {  # numbered options that are themselves a complete, immediately-applicable answer
@@ -213,6 +227,20 @@ DESCRIPTION_FOLLOWUP_RETRY = (  # shown when the reply to DESCRIPTION_FOLLOWUP_Q
 # In-memory conversation state per Telegram user ID; a missing entry means the user is in State A.
 user_states: dict[int, dict] = {}
 
+STATE_TIMEOUT = timedelta(minutes=60)  # how long an unfinished flow survives before it is abandoned
+STATE_EXPIRED_MESSAGE = (  # sent once when a stale flow is dropped, before the new message is processed normally
+    "Pasó más de una hora desde tu última respuesta, y tuve que cerrar lo que estábamos haciendo. "
+    "Vuelve a repetir tu último requerimiento."
+)
+
+
+def state_is_expired(state_info: dict) -> bool:  # has this half-finished flow been idle longer than STATE_TIMEOUT?
+    last_updated = state_info.get("last_updated")  # stamped after every dispatch that leaves the user mid-flow
+    if last_updated is None:  # no stamp yet (state created before this check existed) — treat it as still fresh
+        return False  # never expire an unstamped state, so a missing timestamp can't spam the user
+    return datetime.now(timezone.utc) - last_updated > STATE_TIMEOUT  # expired once the idle gap exceeds the limit
+
+
 PROCESSED_MESSAGE_LIMIT = 50  # how many recent messages to remember for duplicate-delivery protection
 processed_message_ids: deque = deque(maxlen=PROCESSED_MESSAGE_LIMIT)  # (chat_id, message_id) pairs, oldest first
 processed_message_id_set: set = set()  # mirrors the deque above for O(1) duplicate lookups
@@ -250,7 +278,7 @@ def parse_classification(raw_text: str) -> dict:  # defensively parse Claude's J
 
 
 def is_cancellation(text: str) -> bool:  # check whether a message contains a known cancellation phrase
-    normalized = text.strip().lower()  # normalize the text for case-insensitive matching
+    normalized = normalize_reply(text)  # normalize the text for case-insensitive matching
     return any(keyword in normalized for keyword in CANCELLATION_KEYWORDS)  # true if any cancellation keyword appears
 
 
@@ -277,13 +305,13 @@ def fuzzy_match(word: str, candidates: list[str], threshold: float = FUZZY_MATCH
     return matches[0] if matches else None  # the matched candidate string, or None if nothing was close enough
 
 
-RECURRENCE_PHRASES = ["unica vez", "única vez", "una vez", "unico", "único"]  # one-off phrases, checked as substrings
+RECURRENCE_PHRASES = ["unica vez", "una vez", "unico"]  # one-off phrases (de-accented: "única"/"único" normalize here)
 FREQUENCY_CONCEPT_ROOTS = ["frecuenc", "recurrenc"]  # roots of "frecuencia"/"recurrencia", the CATEGORY noun, not a value
 RECURRENCE_VALUE_WORDS = {"recurrente": "recurrente", "variable": "variable"}  # canonical value words, fuzzy-matched below
 
 
 def extract_recurrence_from_text(text: str) -> str | None:  # find an explicit recurrence category among free text
-    normalized = text.strip().lower()  # normalize for case-insensitive matching
+    normalized = normalize_reply(text)  # normalize for case-insensitive matching
     for token in normalized.split():  # check each whitespace-separated word
         cleaned = token.strip(".,;:!?")  # drop trailing punctuation, e.g. "recurrente." -> "recurrente"
         if "ncia" in cleaned:  # "recurrencia"/"frecuencia" are the CATEGORY noun, never a value — skip this token
@@ -297,7 +325,7 @@ def extract_recurrence_from_text(text: str) -> str | None:  # find an explicit r
 
 
 def references_frequency_without_value(text: str) -> bool:  # user named the concept ("frecuencia") but no specific value
-    normalized = text.strip().lower()  # normalize for matching
+    normalized = normalize_reply(text)  # normalize for matching
     mentions_concept = any(root in normalized for root in FREQUENCY_CONCEPT_ROOTS)  # e.g. "frecuencia", "recurrencia"
     return mentions_concept and extract_recurrence_from_text(text) is None  # true only if no concrete value was also given
 
@@ -307,7 +335,7 @@ CATEGORY_VALUE_WORDS = {"negocio": "negocio", "personal": "personal"}  # canonic
 
 
 def extract_category_from_text(text: str) -> str | None:  # find an explicit category value among free text
-    normalized = text.strip().lower()  # normalize for case-insensitive matching
+    normalized = normalize_reply(text)  # normalize for case-insensitive matching
     for token in normalized.split():  # check each whitespace-separated word
         cleaned = token.strip(".,;:!?")  # drop trailing punctuation, e.g. "negocio." -> "negocio"
         match = fuzzy_match(cleaned, list(CATEGORY_VALUE_WORDS))  # typo-tolerant match against the value words
@@ -317,13 +345,13 @@ def extract_category_from_text(text: str) -> str | None:  # find an explicit cat
 
 
 def references_category_without_value(text: str) -> bool:  # user named the concept ("categoría") but no specific value
-    normalized = text.strip().lower()  # normalize for matching
+    normalized = normalize_reply(text)  # normalize for matching
     mentions_concept = any(root in normalized for root in CATEGORY_CONCEPT_ROOTS)  # e.g. "categoría", "categoria"
     return mentions_concept and extract_category_from_text(text) is None  # true only if no concrete value was also given
 
 
 def parse_date_range(text: str) -> tuple[datetime, datetime] | None:  # map a Spanish time-window phrase to a range
-    normalized = text.strip().lower()  # normalize the text for matching
+    normalized = normalize_reply(text)  # normalize the text for matching
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # current time as naive UTC, matching the DB column type
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)  # midnight of the current day
 
@@ -524,7 +552,7 @@ async def save_new_transaction(message, user_id: int, raw_text: str, classificat
 
 
 async def handle_state_overguard_confirm(message, user_id: int, text: str, state_info: dict) -> None:  # handle the
-    normalized = text.strip().lower()  # sí/no reply to the "no debt on record" warning
+    normalized = normalize_reply(text)  # sí/no reply to the "no debt on record" warning
     classification = state_info.get("classification")  # the originally classified transaction, unmodified
     raw_text = state_info.get("raw_text")  # the message that produced it
 
@@ -545,8 +573,10 @@ async def handle_state_overguard_confirm(message, user_id: int, text: str, state
 def description_matches_hint(description: str | None, hint: str) -> bool:  # typo-tolerant description match
     if not description:  # nothing to compare against
         return False  # can't match an empty description
-    normalized_description = description.lower()  # normalize for matching
-    normalized_hint = hint.strip().lower()  # normalize the hint the same way
+    # Both sides are de-accented so a hint typed without accents still finds the stored description that has them
+    # (e.g. searching "administracion" matches a transaction saved as "Pago de administración").
+    normalized_description = normalize_reply(description)  # normalize for matching
+    normalized_hint = normalize_reply(hint)  # normalize the hint the same way
     if normalized_hint in normalized_description:  # fast path: exact substring, no typo (handles most real cases)
         return True  # already an exact match, no need for fuzzy comparison
     words = normalized_description.split()  # compare the hint against each individual word in the description
@@ -1220,7 +1250,7 @@ async def handle_state_d(message, user_id: int, text: str, state_info: dict) -> 
         return  # stop processing this message here
 
     matches = state_info.get("matches", [])  # the candidate transactions found in State C
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
     selected = None  # the transaction the user picked, if any
     went_back_to_c = False  # whether the user rejected the candidate(s) and should redo the search
 
@@ -1281,7 +1311,7 @@ async def handle_state_d_with_new_value(  # handle the three-way reply when Clau
 ) -> None:
     matches = state_info.get("matches", [])  # the candidate transaction (always a single item in this flow)
     match = matches[0] if matches else None  # the transaction being proposed
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # option 1: confirm both the transaction and new value
         updated_row, updates = apply_correction(match, new_value)  # apply the stored new value, as in State E
@@ -1319,7 +1349,7 @@ async def handle_state_e(message, user_id: int, text: str, state_info: dict) -> 
         )
         return  # stop processing this message here
 
-    normalized = text.strip().lower()  # normalize the reply for menu lookups
+    normalized = normalize_reply(text)  # normalize the reply for menu lookups
     if normalized in FIELD_MENU:  # user picked "1. el monto" or "2. la descripción" — needs a follow-up value
         user_states[user_id] = {"state": "E", "match": match, "field": FIELD_MENU[normalized]}  # stay in E, remember field
         prompt = "¿Cuál es el nuevo monto?" if FIELD_MENU[normalized] == "amount" else "¿Cuál es la nueva descripción?"
@@ -1371,7 +1401,7 @@ async def handle_state_e(message, user_id: int, text: str, state_info: dict) -> 
 
 async def handle_state_e_frequency(message, user_id: int, text: str, state_info: dict) -> None:  # handle a specific
     match = state_info.get("match")  # frequency reply — the transaction row selected for correction in State D
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
 
     if is_cancellation(text):  # user wants to abandon the correction after all
         user_states[user_id] = {"state": "E_CANCEL", "match": match}  # move to the sub-state asking what to cancel
@@ -1393,7 +1423,7 @@ async def handle_state_e_frequency(message, user_id: int, text: str, state_info:
 
 async def handle_state_e_category(message, user_id: int, text: str, state_info: dict) -> None:  # handle a specific
     match = state_info.get("match")  # category reply — the transaction row selected for correction in State D
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
 
     if is_cancellation(text):  # user wants to abandon the correction after all
         user_states[user_id] = {"state": "E_CANCEL", "match": match}  # move to the sub-state asking what to cancel
@@ -1415,7 +1445,7 @@ async def handle_state_e_category(message, user_id: int, text: str, state_info: 
 
 async def handle_state_e_description_ask(message, user_id: int, text: str, state_info: dict) -> None:  # handle the
     match = state_info.get("match")  # yes/no reply to "also update the description?" after an amount-only correction
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # user wants to update the description too
         user_states[user_id] = {"state": "E_DESCRIPTION_VALUE", "match": match}  # wait for the new description text
@@ -1440,9 +1470,9 @@ async def handle_state_e_description_value(message, user_id: int, text: str, sta
 
 async def handle_state_e_cancel(message, user_id: int, text: str, state_info: dict) -> None:  # handle cancel-scope reply
     match = state_info.get("match")  # the transaction that was being corrected
-    normalized = text.strip().lower()  # normalize the reply for simple keyword matching
+    normalized = normalize_reply(text)  # normalize the reply for simple keyword matching
 
-    if normalized == "1" or "corrección" in normalized or "correccion" in normalized:  # user only wants to abandon it
+    if normalized == "1" or "correccion" in normalized:  # de-accented, so "corrección" matches too  # user only wants to abandon it
         supabase.table("transactions").update({"status": "activa"}).eq("id", match["id"]).execute()  # restore status
         user_states.pop(user_id, None)  # correction is abandoned, return this user to State A
         await message.reply_text(  # confirm that only the correction was cancelled
@@ -1450,7 +1480,7 @@ async def handle_state_e_cancel(message, user_id: int, text: str, state_info: di
         )
         return  # stop processing this message here
 
-    if normalized == "2" or "transacción" in normalized or "transaccion" in normalized:  # void the whole transaction
+    if normalized == "2" or "transaccion" in normalized:  # de-accented, so "transacción" matches too  # void the whole transaction
         supabase.table("transactions").update(  # mark the transaction as void
             {"status": "anulada", "updated_at": now_iso()}  # set status and refresh the update timestamp
         ).eq("id", match["id"]).execute()  # apply the update to the matched row
@@ -1464,7 +1494,7 @@ async def handle_state_e_cancel(message, user_id: int, text: str, state_info: di
 
 
 async def handle_state_r(message, user_id: int, text: str, state_info: dict) -> None:  # handle a report follow-up reply
-    normalized = text.strip().lower()  # normalize the reply for matching
+    normalized = normalize_reply(text)  # normalize the reply for matching
     today = today_local()  # reference date for "semana"/"mes"
 
     if normalized == "1" or "esta semana" in normalized:  # option 1: show this week's report instead
@@ -1509,7 +1539,7 @@ async def handle_state_r_date_manual(message, user_id: int, text: str, state_inf
 
 
 async def handle_state_r_debtors_followup(message, user_id: int, text: str, state_info: dict) -> None:  # handle the
-    normalized = text.strip().lower()  # sí/no reply to "¿Quieres ver la lista de acreedores también?"
+    normalized = normalize_reply(text)  # sí/no reply to "¿Quieres ver la lista de acreedores también?"
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # user wants to see the creditor list too
         await send_creditor_list(message, user_id)  # show it
     elif normalized == "2" or normalized in NEGATIVE_REPLIES:  # user is done with reports
@@ -1523,6 +1553,12 @@ async def handle_state_r_debtors_followup(message, user_id: int, text: str, stat
 async def process_text(message, user_id: int, text: str) -> None:  # dispatch already-extracted text to its state
     # handler. Typed messages and transcribed voice notes both land here, so a voice note is treated exactly like
     # the same words typed — including mid-flow replies ("sí" in State D confirms, it does not start a new transaction).
+    stale_state = user_states.get(user_id)  # the flow this user was in, if any (absent means they're in State A)
+    if stale_state is not None and state_is_expired(stale_state):  # they left a flow hanging for over an hour
+        user_states.pop(user_id, None)  # abandon it and return them to State A
+        await message.reply_text(STATE_EXPIRED_MESSAGE)  # tell them first, then fall through and handle their message
+        # State A needs no notice, and that's automatic: a user already in State A has no entry to expire.
+
     state_info = user_states.get(user_id, {"state": "A"})  # look up this user's state, defaulting to State A
     state = state_info.get("state", "A")  # extract the state name, defaulting to State A
 
@@ -1561,6 +1597,11 @@ async def process_text(message, user_id: int, text: str) -> None:  # dispatch al
         logger.exception("Failed to process message in state %s", state)  # log the full traceback for debugging
         user_states.pop(user_id, None)  # reset this user's state so they aren't stuck in a broken flow
         await message.reply_text("Hubo un error al procesar tu mensaje. Intenta de nuevo.")  # tell the user
+
+    # Stamp whatever state the handler left behind. Every state change happens inside the dispatch above, so this
+    # single line keeps last_updated current for all of them — no per-assignment bookkeeping scattered across handlers.
+    if user_id in user_states:  # the user is still mid-flow (a completed flow popped its state and needs no stamp)
+        user_states[user_id]["last_updated"] = datetime.now(timezone.utc)  # restart the 60-minute idle clock
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # entry point for text messages
