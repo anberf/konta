@@ -228,9 +228,9 @@ DESCRIPTION_FOLLOWUP_RETRY = (  # shown when the reply to DESCRIPTION_FOLLOWUP_Q
 user_states: dict[int, dict] = {}
 
 STATE_TIMEOUT = timedelta(minutes=60)  # how long an unfinished flow survives before it is abandoned
-STATE_EXPIRED_MESSAGE = (  # sent once when a stale flow is dropped, before the new message is processed normally
-    "Pasó más de una hora desde tu última respuesta, y tuve que cerrar lo que estábamos haciendo. "
-    "Vuelve a repetir tu último requerimiento."
+STATE_EXPIRED_MESSAGE = (  # sent when a stale flow is dropped; the triggering message itself is NOT processed
+    "Pasó más de una hora desde tu última respuesta, así que cerré lo que estábamos haciendo. "
+    "Vuelve a escribirme lo que necesitas 👍"
 )
 
 
@@ -1156,7 +1156,8 @@ async def handle_state_a(message, user_id: int, text: str) -> None:  # handle a 
                 await message.reply_text("No encontré ninguna transacción activa para eliminar.")
 
     else:  # intent is "confirmation" (or anything unexpected) with nothing pending to confirm
-        await message.reply_text("No tengo ninguna corrección pendiente de confirmar.")  # nothing to confirm
+        logger.info("Intent %r with nothing pending to confirm/act on for user %s", intent, user_id)  # diagnostic only
+        await message.reply_text("OK ✅")  # user-facing reply stays simple; stay in State A (no state change needed)
 
 
 async def handle_state_b(message, user_id: int, text: str, state_info: dict) -> None:  # handle a clarification reply
@@ -1556,7 +1557,8 @@ async def process_text(message, user_id: int, text: str) -> None:  # dispatch al
     stale_state = user_states.get(user_id)  # the flow this user was in, if any (absent means they're in State A)
     if stale_state is not None and state_is_expired(stale_state):  # they left a flow hanging for over an hour
         user_states.pop(user_id, None)  # abandon it and return them to State A
-        await message.reply_text(STATE_EXPIRED_MESSAGE)  # tell them first, then fall through and handle their message
+        await message.reply_text(STATE_EXPIRED_MESSAGE)  # tell them the flow was closed
+        return  # stop here — the triggering message itself is discarded, not processed; their NEXT message starts fresh
         # State A needs no notice, and that's automatic: a user already in State A has no entry to expire.
 
     state_info = user_states.get(user_id, {"state": "A"})  # look up this user's state, defaulting to State A
