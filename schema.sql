@@ -11,12 +11,18 @@ create table if not exists transactions (
     creditor_name text,
     status text default 'activa',
     is_test boolean default true,
+    channel text default 'telegram',
     created_at timestamp default now(),
     updated_at timestamp
 );
 
 -- Marks rows created during testing so they can be found and cleaned up separately from real vendor data
 alter table transactions add column if not exists is_test boolean default true;
+
+-- Which messaging channel a transaction arrived on. Existing rows default to 'telegram', which is correct
+-- because Telegram was the only channel before this column existed. Every query filters on (channel, user_id)
+-- so the same numeric user ID on two different channels can never collide.
+alter table transactions add column if not exists channel text default 'telegram';
 
 -- Postgres-level grants
 grant select, insert, update on public.transactions to anon;
@@ -35,3 +41,7 @@ create policy "bot can update transactions" on public.transactions
 -- Period index for faster report queries
 create index if not exists idx_transactions_user_created
     on transactions(user_id, created_at, status);
+
+-- Channel-scoped variant of the index above, matching the (channel, user_id) filter every query now applies
+create index if not exists idx_transactions_channel_user_created
+    on transactions(channel, user_id, created_at, status);
