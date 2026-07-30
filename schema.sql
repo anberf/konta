@@ -38,6 +38,36 @@ create policy "bot can insert transactions" on public.transactions
 create policy "bot can update transactions" on public.transactions
     for update to anon using (true) with check (true);
 
+-- ---------------------------------------------------------------------------
+-- Conversation state, one row per (channel, user_id). Lives in the database
+-- rather than process memory so an unfinished flow survives a restart and two
+-- channel processes never disagree about where a user is.
+-- ---------------------------------------------------------------------------
+create table if not exists user_state (
+    channel text not null,
+    user_id text not null,
+    state text not null default 'A',
+    state_data jsonb default '{}'::jsonb,
+    updated_at timestamp default now(),
+    primary key (channel, user_id)
+);
+
+-- Without these the anon key gets "permission denied for table user_state".
+-- The bot only reads, inserts and updates (clearing a flow writes state='A'), so no delete grant is needed.
+grant select, insert, update on public.user_state to anon;
+
+-- Row Level Security policies, matching the transactions table's setup
+alter table public.user_state enable row level security;
+
+create policy "bot can select user_state" on public.user_state
+    for select to anon using (true);
+
+create policy "bot can insert user_state" on public.user_state
+    for insert to anon with check (true);
+
+create policy "bot can update user_state" on public.user_state
+    for update to anon using (true) with check (true);
+
 -- Period index for faster report queries
 create index if not exists idx_transactions_user_created
     on transactions(user_id, created_at, status);

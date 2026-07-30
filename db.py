@@ -260,6 +260,46 @@ def save_correction(match: dict, field_updates: dict, raw_message: str) -> tuple
     return updated_row, updates  # return both the full row and just the changed fields, for building the reply
 
 
+def parse_timestamp(value) -> datetime:  # parse a Supabase timestamp into a naive-UTC datetime
+    if isinstance(value, datetime):  # already a datetime (some client versions parse it for us)
+        return value.replace(tzinfo=None) if value.tzinfo else value  # normalize to naive
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))  # tolerate a trailing "Z"
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed  # naive UTC
+
+
+def get_user_state(channel: str, user_id: str) -> dict:  # this user's conversation state, or a State A default
+    result = (  # one row per (channel, user_id) — the table's primary key
+        _scoped(supabase.table("user_state").select("*"), channel, user_id).limit(1).execute()
+    )
+    rows = result.data or []  # the stored row, or nothing if this user has never had state saved
+    if not rows:  # no row yet — this user is in State A and has never started a flow
+        return {"state": "A", "state_data": {}, "updated_at": datetime.now(timezone.utc).replace(tzinfo=None)}
+    row = rows[0]  # the stored state row
+    return {
+        "state": row.get("state") or "A",  # the state name, defaulting to State A
+        "state_data": row.get("state_data") or {},  # the flow's working data, as stored JSON
+        "updated_at": parse_timestamp(row["updated_at"]) if row.get("updated_at") else
+                      datetime.now(timezone.utc).replace(tzinfo=None),  # when this state was last written
+    }
+
+
+def save_user_state(channel: str, user_id: str, state: str, state_data: dict) -> None:  # upsert this user's state
+    supabase.table("user_state").upsert(  # insert, or overwrite the existing row for this (channel, user_id)
+        {
+            "channel": channel,  # part of the composite primary key
+            "user_id": str(user_id),  # part of the composite primary key
+            "state": state,  # the state name the flow is now in
+            "state_data": state_data,  # JSON-serializable working data for that flow
+            "updated_at": now_iso(),  # written from the app clock so the expiry check compares like with like
+        },
+        on_conflict="channel,user_id",  # the primary key, so a repeat message updates rather than duplicates
+    ).execute()
+
+
+def clear_user_state(channel: str, user_id: str) -> None:  # return this user to State A with no working data
+    save_user_state(channel, user_id, "A", {})  # keep the row, reset its contents
+
+
 def void_transaction(transaction_id) -> None:  # mark one transaction as voided ("anulada")
     supabase.table("transactions").update(  # void that transaction
         {"status": "anulada", "updated_at": now_iso()}  # mark it voided and refresh the update timestamp

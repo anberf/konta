@@ -232,9 +232,9 @@ EXAMPLES_MESSAGE = (  # sent right after the welcome message, showing the range 
     "• A quién le debes: \"a quién le debo\""
 )
 
-# In-memory conversation state, keyed by (channel, user_id) so the same numeric ID on two channels never collides.
-# A missing entry means that user is in State A.
-user_states: dict[tuple[str, str], dict] = {}
+# Conversation state lives in Supabase (table user_state, keyed by channel + user_id), so it survives restarts and
+# is shared across processes. Within a single message it is held in a plain dict — the "session" — which handlers
+# read and mutate via transition()/finish(); handle_incoming_message loads it before dispatch and saves it after.
 
 STATE_TIMEOUT = timedelta(minutes=60)  # how long an unfinished flow survives before it is abandoned
 STATE_EXPIRED_MESSAGE = (  # sent when a stale flow is dropped; the triggering message itself is NOT processed
@@ -243,15 +243,43 @@ STATE_EXPIRED_MESSAGE = (  # sent when a stale flow is dropped; the triggering m
 )
 
 
-def state_key(channel: str, user_id: str) -> tuple[str, str]:  # the composite key every state lookup uses
-    return (channel, str(user_id))  # user_id is normalized to str so int/str callers land on the same entry
+def transition(session: dict, new_state: dict) -> None:  # move this flow to a new state, replacing its working data
+    session.clear()  # drop the previous state's fields so nothing leaks between flows
+    session.update(new_state)  # adopt the new state name and its data
 
 
-def state_is_expired(state_info: dict) -> bool:  # has this half-finished flow been idle longer than STATE_TIMEOUT?
-    last_updated = state_info.get("last_updated")  # stamped after every dispatch that leaves the user mid-flow
-    if last_updated is None:  # no stamp yet (state created before this check existed) — treat it as still fresh
-        return False  # never expire an unstamped state, so a missing timestamp can't spam the user
-    return datetime.now(timezone.utc) - last_updated > STATE_TIMEOUT  # expired once the idle gap exceeds the limit
+def finish(session: dict) -> None:  # end the flow and return the user to State A
+    session.clear()  # an empty session means State A
+    session["state"] = "A"  # spelled out so callers reading session["state"] always find a value
+
+
+def state_is_expired(state: str, updated_at: datetime) -> bool:  # idle longer than STATE_TIMEOUT, mid-flow?
+    if state == "A":  # State A is the resting state — there is no flow to abandon, so it never expires
+        return False  # and the user is never told anything
+    if updated_at is None:  # no timestamp stored — treat it as still fresh rather than risk spurious messages
+        return False
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, matching what Supabase stores
+    return now - updated_at > STATE_TIMEOUT  # expired once the idle gap exceeds the limit
+
+
+# state_data must survive a round trip through JSONB. Everything handlers store is already JSON-native (strings,
+# booleans, Supabase rows, Claude's parsed classification) with one exception: date_range, a tuple of two
+# datetimes. These two functions convert just that field, so nothing else has to care.
+
+def serialize_state_data(session: dict) -> dict:  # session -> JSON-safe dict for Supabase (excludes "state")
+    data = {key: value for key, value in session.items() if key != "state"}  # "state" is its own column
+    date_range = data.get("date_range")  # the only non-JSON-native field a handler ever stores
+    if date_range:  # a (start, end) pair of datetimes
+        data["date_range"] = [date_range[0].isoformat(), date_range[1].isoformat()]  # store as ISO strings
+    return data
+
+
+def deserialize_state_data(data: dict) -> dict:  # JSON dict from Supabase -> session fields
+    restored = dict(data or {})  # copy so the caller's dict is not mutated
+    date_range = restored.get("date_range")  # was written as a two-item list of ISO strings
+    if date_range:  # rebuild the tuple of datetimes the handlers expect
+        restored["date_range"] = (datetime.fromisoformat(date_range[0]), datetime.fromisoformat(date_range[1]))
+    return restored
 
 
 def classify_message(prompt_text: str) -> dict:  # call Claude to classify a message and return the parsed JSON result
@@ -651,31 +679,31 @@ def parse_date_expression(text: str) -> date | None:  # ask Claude to resolve a 
         return None  # signal failure to the caller
 
 
-def send_period_report(channel: str, user_id: str, start: date, end: date, header: str) -> list[str]:  # show a report,
+def send_period_report(channel: str, user_id: str, session: dict, start: date, end: date, header: str) -> list[str]:  # show a report,
     totals = db.get_period_report(channel, user_id, start, end)  # then enter the follow-up state
-    user_states[state_key(channel, user_id)] = {"state": "R"}  # await a follow-up choice (another period, or "no")
+    transition(session, {"state": "R"})  # await a follow-up choice (another period, or "no")
     return [format_period_report(totals, header)]  # the formatted report
 
 
-def send_debtor_list(channel: str, user_id: str) -> list[str]:  # show the debtor list, then offer the creditor list
+def send_debtor_list(channel: str, user_id: str, session: dict) -> list[str]:  # show the debtor list, then offer the creditor list
     debtors, overpaid = db.get_debtor_list(channel, user_id)  # who owes the vendor, and who they overcollected from
-    user_states[state_key(channel, user_id)] = {"state": "R_DEBTORS_FOLLOWUP"}  # await sí/no on the creditor list
+    transition(session, {"state": "R_DEBTORS_FOLLOWUP"})  # await sí/no on the creditor list
     return [format_debtor_list(debtors, overpaid)]  # the formatted list
 
 
-def send_creditor_list(channel: str, user_id: str) -> list[str]:  # show the creditor list; nothing to follow up with
+def send_creditor_list(channel: str, user_id: str, session: dict) -> list[str]:  # show the creditor list; nothing to follow up with
     creditors, overpaid = db.get_creditor_list(channel, user_id)  # who the vendor owes, and who they overpaid
-    user_states.pop(state_key(channel, user_id), None)  # this report has no further follow-up, return to State A
+    finish(session)  # this report has no further follow-up, return to State A
     return [format_creditor_list(creditors, overpaid)]  # the formatted list
 
 
-def handle_custom_date_query(channel: str, user_id: str, date_hint: str | None) -> list[str]:  # "custom" query_period
+def handle_custom_date_query(channel: str, user_id: str, session: dict, date_hint: str | None) -> list[str]:  # "custom" query_period
     today = today_local()  # end of the report range is always today
     parsed = parse_date_expression(date_hint) if date_hint else None  # try to resolve the hint to a start date
     if parsed is not None:  # Claude confidently parsed a start date
         header = f"Resumen desde {parsed:%d/%m/%Y} al {today:%d/%m/%Y}"  # date-range header
-        return send_period_report(channel, user_id, parsed, today, header)  # show the report
-    user_states[state_key(channel, user_id)] = {"state": "R_DATE_MANUAL"}  # await a DD/MM/YYYY reply
+        return send_period_report(channel, user_id, session, parsed, today, header)  # show the report
+    transition(session, {"state": "R_DATE_MANUAL"})  # await a DD/MM/YYYY reply
     return [R_DATE_MANUAL_QUESTION]  # ask for the manual format
 
 
@@ -687,8 +715,7 @@ def cancel_last_transaction(channel: str, user_id: str) -> list[str]:  # void th
     return [f"Listo, anulé la última transacción ✅ {format_transaction(row)}"]  # confirm, including its details
 
 
-def save_new_transaction(channel: str, user_id: str, raw_text: str, classification: dict) -> list[str]:  # finalize a
-    key = state_key(channel, user_id)  # new_transaction classification, splitting overpayments of a
+def save_new_transaction(channel: str, user_id: str, session: dict, raw_text: str, classification: dict) -> list[str]:  # finalize a
     transaction_type = classification.get("type")  # pago_deuda/cobro against the existing balance
     amount = classification.get("amount") or 0
     category = classification.get("category")
@@ -699,7 +726,7 @@ def save_new_transaction(channel: str, user_id: str, raw_text: str, classificati
         balance = db.get_creditor_balance(channel, user_id, creditor_name, category) if creditor_name else 0
 
         if balance <= 0:  # no debt on record for this creditor/category — confirm before saving anything
-            user_states[key] = {"state": "OVERGUARD_CONFIRM", "classification": classification, "raw_text": raw_text}
+            transition(session, {"state": "OVERGUARD_CONFIRM", "classification": classification, "raw_text": raw_text})
             return [OVERGUARD_QUESTION_TEMPLATE.format(name=creditor_name or "esa persona")]
 
         if amount > balance:  # paid more than what was owed — split into a debt-closing part and an excess loan
@@ -720,7 +747,7 @@ def save_new_transaction(channel: str, user_id: str, raw_text: str, classificati
         balance = db.get_debtor_balance(channel, user_id, debtor_name) if debtor_name else 0
 
         if balance <= 0:  # no debt on record for this debtor — confirm before saving anything
-            user_states[key] = {"state": "OVERGUARD_CONFIRM", "classification": classification, "raw_text": raw_text}
+            transition(session, {"state": "OVERGUARD_CONFIRM", "classification": classification, "raw_text": raw_text})
             return [OVERGUARD_QUESTION_TEMPLATE.format(name=debtor_name or "esa persona")]
 
         if amount > balance:  # collected more than what was owed — split into a debt-closing part and an excess debt
@@ -740,38 +767,36 @@ def save_new_transaction(channel: str, user_id: str, raw_text: str, classificati
     return [build_new_transaction_confirmation(classification)]
 
 
-def handle_state_overguard_confirm(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # handle the
-    key = state_key(channel, user_id)  # sí/no reply to the "no debt on record" warning
+def handle_state_overguard_confirm(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # handle the
     normalized = normalize_reply(text)
-    classification = state_info.get("classification")  # the originally classified transaction, unmodified
-    raw_text = state_info.get("raw_text")  # the message that produced it
+    classification = session.get("classification")  # the originally classified transaction, unmodified
+    raw_text = session.get("raw_text")  # the message that produced it
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # vendor confirmed: save it anyway, as-is
-        user_states.pop(key, None)  # return to State A
+        finish(session)  # return to State A
         db.save_transaction(channel, user_id, raw_text, classification)  # no balance to split against, save it all
         return [build_new_transaction_confirmation(classification)]
 
     if normalized == "2" or normalized in NEGATIVE_REPLIES:  # vendor declined: discard it
-        user_states.pop(key, None)  # return to State A
+        finish(session)  # return to State A
         return ["OK ✅ No se registró nada."]
 
     return ["No entendí. Responde con el número o la palabra:\n1. sí\n2. no"]  # unrecognized reply
 
 
-def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handle a message with no flow in progress
-    key = state_key(channel, user_id)
+def handle_state_a(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # handle a message with no flow in progress
     classification = classify_message(text)  # ask Claude to classify the message
     logger.info("Classification for %r: %s", text, json.dumps(classification, ensure_ascii=False))  # debug visibility
     intent = classification.get("intent")  # extract the classified intent
 
     if intent == "new_transaction":  # the user is registering a new transaction
         if classification.get("needs_clarification"):  # Claude needs more information before saving
-            user_states[key] = {"state": "B", "original_text": text}  # remember the text, move to State B
+            transition(session, {"state": "B", "original_text": text})  # remember the text, move to State B
             return [  # choose the clarification question to ask
                 classification.get("clarification_question")  # Claude's suggested question
                 or "¿Puedes dar más detalles?"  # generic fallback if none was provided
             ]
-        return save_new_transaction(channel, user_id, text, classification)  # save it, splitting overpayments
+        return save_new_transaction(channel, user_id, session, text, classification)  # save it, splitting overpayments
 
     if intent == "correction":  # the user wants to fix a past transaction
         hint = normalize_classification_value(classification.get("correction_hint"))  # the OLD field value, if named
@@ -783,7 +808,7 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
 
         if len(candidates) == 1 and new_value:  # exactly one candidate, and Claude already knows the new value too
             candidate = candidates[0]  # the single candidate transaction
-            user_states[key] = {  # go straight to State D with the candidate and the proposed new value
+            transition(session, {  # go straight to State D with the candidate and the proposed new value
                 "state": "D",  # State D: awaiting confirmation
                 "matches": [candidate],  # only one candidate to confirm
                 "date_range": None,  # no date range has been resolved yet
@@ -791,7 +816,7 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "new_value": new_value,  # the new value to apply immediately if the user confirms both
                 "action": "correct",  # this confirmation leads to a correction, not a deletion
-            }
+            })
             return [  # show the transaction, the proposed new value, and ask for confirmation
                 f"¿Te refieres a esta transacción? {format_transaction(candidate)}\n"
                 f"¿Y el nuevo valor es {new_value}? Responde con el número o la palabra:\n"
@@ -799,33 +824,33 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
             ]
         if len(candidates) == 1:  # exactly one candidate, but no new value was extracted yet
             candidate = candidates[0]  # the single candidate transaction
-            user_states[key] = {  # go straight to State D with this transaction as the candidate
+            transition(session, {  # go straight to State D with this transaction as the candidate
                 "state": "D",  # State D: awaiting confirmation
                 "matches": [candidate],  # only one candidate to confirm
                 "date_range": None,  # no date range has been resolved yet
                 "correction_hint": hint,  # keep the original hint in case the user rejects this candidate
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "action": "correct",  # this confirmation leads to a correction, not a deletion
-            }
+            })
             return [  # show the transaction and ask for confirmation
                 f"¿Te refieres a esta transacción? {format_transaction(candidate)}\n{YES_NO_MENU}"
             ]
         if candidates:  # multiple candidates matched (typos included), ask which one instead of guessing
-            user_states[key] = {  # go straight to State D with every candidate to choose from
+            transition(session, {  # go straight to State D with every candidate to choose from
                 "state": "D",  # State D: awaiting confirmation
                 "matches": candidates,  # every candidate the fuzzy search found
                 "date_range": None,  # no date range has been resolved yet
                 "correction_hint": hint,  # keep the original hint in case all candidates are rejected
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "action": "correct",  # this confirmation leads to a correction, not a deletion
-            }
+            })
             return [build_multi_match_prompt(candidates, "corregir")]  # show the list, ask which one
-        user_states[key] = {  # this user has no transactions at all yet, fall back to the time-window question
+        transition(session, {  # this user has no transactions at all yet, fall back to the time-window question
             "state": "C",  # State C: awaiting the time window
             "correction_hint": hint,  # the OLD value/description to search for
             "date_range": None,  # no date range chosen yet
             "action": "correct",  # this search leads to a correction, not a deletion
-        }
+        })
         return [TIME_WINDOW_QUESTION]  # ask the user when the transaction happened
 
     if intent == "query":  # the user is asking for a balance or report
@@ -834,18 +859,18 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
 
         if query_period == "semana":  # this week, Monday through today
             start = week_start(today)  # Monday of the current week
-            return send_period_report(channel, user_id, start, today, f"Resumen de esta semana — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
+            return send_period_report(channel, user_id, session, start, today, f"Resumen de esta semana — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
         if query_period == "mes":  # this month, the 1st through today
             start = today.replace(day=1)  # first day of the current month
-            return send_period_report(channel, user_id, start, today, f"Resumen de este mes — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
+            return send_period_report(channel, user_id, session, start, today, f"Resumen de este mes — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
         if query_period == "deudores":  # who owes the vendor money
-            return send_debtor_list(channel, user_id)  # show the debtor list
+            return send_debtor_list(channel, user_id, session)  # show the debtor list
         if query_period == "acreedores":  # who the vendor owes money to
-            return send_creditor_list(channel, user_id)  # show the creditor list
+            return send_creditor_list(channel, user_id, session)  # show the creditor list
         if query_period == "custom":  # the user named a specific starting point
-            return handle_custom_date_query(channel, user_id, classification.get("query_date_hint"))  # resolve it
+            return handle_custom_date_query(channel, user_id, session, classification.get("query_date_hint"))  # resolve it
         if query_period == "hoy":  # today's status
-            return send_period_report(channel, user_id, today, today, f"Resumen de hoy — {today:%d/%m/%Y}")
+            return send_period_report(channel, user_id, session, today, today, f"Resumen de hoy — {today:%d/%m/%Y}")
         return [  # query_period is null — ambiguous, ask the user to be specific instead of guessing
             "No entendí qué quieres consultar. ¿Hoy, esta semana, este mes, deudores, o acreedores?"
         ]
@@ -859,26 +884,26 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
         candidates = resolve_shortcut_candidates(channel, user_id, keyword)  # typo-tolerant search, recent fallback
         if len(candidates) == 1:  # exactly one candidate
             candidate = candidates[0]  # the single candidate transaction
-            user_states[key] = {  # go straight to State D with this transaction as the candidate
+            transition(session, {  # go straight to State D with this transaction as the candidate
                 "state": "D",  # State D: awaiting confirmation
                 "matches": [candidate],  # only one candidate to confirm
                 "date_range": None,  # no date range has been resolved yet
                 "correction_hint": keyword,  # keep the keyword in case the user rejects this candidate
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "action": "delete",  # this confirmation leads to a deletion, not a correction
-            }
+            })
             return [  # show the transaction and ask for confirmation before deleting it
                 f"¿Quieres eliminar esta transacción? {format_transaction(candidate)}\n{YES_NO_MENU}"
             ]
         if candidates:  # multiple candidates matched (typos included), ask which one instead of guessing
-            user_states[key] = {  # go straight to State D with every candidate to choose from
+            transition(session, {  # go straight to State D with every candidate to choose from
                 "state": "D",  # State D: awaiting confirmation
                 "matches": candidates,  # every candidate the fuzzy search found
                 "date_range": None,  # no date range has been resolved yet
                 "correction_hint": keyword,  # keep the keyword in case all candidates are rejected
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "action": "delete",  # this confirmation leads to a deletion, not a correction
-            }
+            })
             return [build_multi_match_prompt(candidates, "eliminar")]  # show the list, ask which
         return ["No encontré ninguna transacción activa para eliminar."]  # this user has no transactions at all
 
@@ -887,9 +912,8 @@ def handle_state_a(channel: str, user_id: str, text: str) -> list[str]:  # handl
     return ["OK ✅"]  # user-facing reply stays simple; stay in State A (no state change needed)
 
 
-def handle_state_b(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a clarification reply
-    key = state_key(channel, user_id)
-    original = state_info.get("original_text", "")  # the message that originally triggered the clarification
+def handle_state_b(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a clarification reply
+    original = session.get("original_text", "")  # the message that originally triggered the clarification
     combined = (  # build the combined message to re-classify
         f"Mensaje original: {original}\n"  # include the original message
         f"Respuesta del usuario a la pregunta de aclaración: {text}"  # include the user's clarifying reply
@@ -898,28 +922,27 @@ def handle_state_b(channel: str, user_id: str, text: str, state_info: dict) -> l
     intent = classification.get("intent")  # extract the classified intent
 
     if intent == "cancellation":  # the user cancelled instead of clarifying
-        user_states.pop(key, None)  # abandon the pending transaction, return this user to State A
+        finish(session)  # abandon the pending transaction, return this user to State A
         return ["Listo, no anoto nada ✅"]  # confirm nothing was saved
 
     if classification.get("needs_clarification"):  # Claude still needs more information
-        user_states[key] = {"state": "B", "original_text": combined}  # stay in State B with updated context
+        transition(session, {"state": "B", "original_text": combined})  # stay in State B with updated context
         return [  # choose the next clarification question to ask
             classification.get("clarification_question")  # Claude's suggested question
             or "¿Puedes dar más detalles?"  # generic fallback if none was provided
         ]
 
-    user_states.pop(key, None)  # clarification flow is complete; save_new_transaction may set a fresh state below
-    return save_new_transaction(channel, user_id, combined, classification)  # save it, splitting overpayments
+    finish(session)  # clarification flow is complete; save_new_transaction may set a fresh state below
+    return save_new_transaction(channel, user_id, session, combined, classification)  # save it, splitting overpayments
 
 
-def handle_state_c(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a time-window reply
-    key = state_key(channel, user_id)
+def handle_state_c(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a time-window reply
     if is_cancellation(text):  # the user wants to abandon the correction entirely
-        user_states.pop(key, None)  # return this user to State A
+        finish(session)  # return this user to State A
         return ["Listo, no cambio nada ✅"]  # confirm nothing was changed
 
-    date_range = state_info.get("date_range")  # the previously resolved date range, if any
-    hint = state_info.get("correction_hint")  # the current correction hint (the old value to search for)
+    date_range = session.get("date_range")  # the previously resolved date range, if any
+    hint = session.get("correction_hint")  # the current correction hint (the old value to search for)
 
     if date_range is None:  # we don't have a date range yet, so this reply should specify one
         parsed_range = parse_date_range(text)  # try to parse a time-window phrase from the reply
@@ -932,24 +955,24 @@ def handle_state_c(channel: str, user_id: str, text: str, state_info: dict) -> l
     start, end = date_range  # unpack the resolved date range
     matches = search_transactions(channel, user_id, start, end, hint)  # search Supabase for matching transactions
 
-    action = state_info.get("action", "correct")  # whether this search leads to a correction or a deletion
+    action = session.get("action", "correct")  # whether this search leads to a correction or a deletion
     verb = "corregir" if action == "correct" else "eliminar"  # the verb to use in the confirmation prompts below
 
     if not matches:  # no transactions matched the range and hint
-        user_states[key] = {  # stay in State C, keeping the date range for the next attempt
+        transition(session, {  # stay in State C, keeping the date range for the next attempt
             "state": "C",  # still State C
             "correction_hint": hint,  # remember the hint that produced no matches
             "date_range": date_range,  # keep the resolved date range
             "action": action,  # keep the original action (correct or delete)
-        }
+        })
         return ["No encontré ninguna transacción con esos datos. ¿Puedes describirla diferente?"]
 
-    user_states[key] = {  # move to State D
+    transition(session, {  # move to State D
         "state": "D",  # State D: awaiting confirmation
         "matches": matches,  # the candidate transactions found above
         "date_range": date_range,  # keep the resolved date range in case of rejection
         "action": action,  # keep the original action (correct or delete)
-    }
+    })
 
     if len(matches) == 1:  # exactly one transaction matched
         return [  # show it and ask for confirmation
@@ -959,17 +982,16 @@ def handle_state_c(channel: str, user_id: str, text: str, state_info: dict) -> l
     return [build_multi_match_prompt(matches, verb)]  # multiple matched: show the list, ask which one
 
 
-def handle_state_d(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a match-selection reply
-    key = state_key(channel, user_id)
+def handle_state_d(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a match-selection reply
     if is_cancellation(text):  # the user wants to abandon the correction entirely
-        user_states.pop(key, None)  # return this user to State A
+        finish(session)  # return this user to State A
         return ["Listo, no cambio nada ✅"]  # confirm nothing was changed
 
-    new_value = state_info.get("new_value")  # a new value Claude already extracted alongside the candidate, if any
+    new_value = session.get("new_value")  # a new value Claude already extracted alongside the candidate, if any
     if new_value is not None:  # this D state offers a three-way choice instead of a plain yes/no
-        return handle_state_d_with_new_value(channel, user_id, text, state_info, new_value)  # delegate to that branch
+        return handle_state_d_with_new_value(channel, user_id, text, session, new_value)  # delegate to that branch
 
-    matches = state_info.get("matches", [])  # the candidate transactions found in State C
+    matches = session.get("matches", [])  # the candidate transactions found in State C
     normalized = normalize_reply(text)  # normalize the reply for matching
     selected = None  # the transaction the user picked, if any
     went_back_to_c = False  # whether the user rejected the candidate(s) and should redo the search
@@ -987,23 +1009,23 @@ def handle_state_d(channel: str, user_id: str, text: str, state_info: dict) -> l
             if 1 <= index <= len(matches):  # the index is within range
                 selected = matches[index - 1]  # select the corresponding candidate
 
-    action = state_info.get("action", "correct")  # whether this confirmation leads to a correction or a deletion
+    action = session.get("action", "correct")  # whether this confirmation leads to a correction or a deletion
 
     if went_back_to_c:  # the user rejected the candidate(s) and the search must be redone
-        if state_info.get("from_shortcut"):  # this candidate came from the last-transaction shortcut, not a real search
-            user_states[key] = {  # move to State C to ask for the time window instead
+        if session.get("from_shortcut"):  # this candidate came from the last-transaction shortcut, not a real search
+            transition(session, {  # move to State C to ask for the time window instead
                 "state": "C",  # State C: awaiting the time window
-                "correction_hint": state_info.get("correction_hint"),  # keep the original hint from classification
+                "correction_hint": session.get("correction_hint"),  # keep the original hint from classification
                 "date_range": None,  # no date range chosen yet
                 "action": action,  # keep the original action (correct or delete)
-            }
+            })
             return [TIME_WINDOW_QUESTION]  # ask the user when the transaction happened
-        user_states[key] = {  # this candidate came from an actual State C search, ask for a new description
+        transition(session, {  # this candidate came from an actual State C search, ask for a new description
             "state": "C",  # back to State C
             "correction_hint": None,  # await a new description from the user
-            "date_range": state_info.get("date_range"),  # keep the previously resolved date range
+            "date_range": session.get("date_range"),  # keep the previously resolved date range
             "action": action,  # keep the original action (correct or delete)
-        }
+        })
         return ["¿Puedes describirla de otra forma?"]  # ask for a new description
 
     if selected is None:  # the reply didn't resolve to a valid selection
@@ -1011,70 +1033,68 @@ def handle_state_d(channel: str, user_id: str, text: str, state_info: dict) -> l
 
     if action == "delete":  # this confirmation was for a deletion — void it now, no further steps
         db.void_transaction(selected["id"])  # mark the selected transaction as void
-        user_states.pop(key, None)  # deletion flow is complete, return this user to State A
+        finish(session)  # deletion flow is complete, return this user to State A
         return [f"Listo, eliminé esta transacción ✅ {format_transaction(selected)}"]  # confirm it
 
-    user_states[key] = {"state": "E", "match": selected}  # move to State E with the confirmed transaction
+    transition(session, {"state": "E", "match": selected})  # move to State E with the confirmed transaction
     return [NEW_VALUE_PROMPT]  # ask for the new value, description, or recurrence
 
 
 def handle_state_d_with_new_value(  # handle the three-way reply when Claude already extracted both the
-    channel: str, user_id: str, text: str, state_info: dict, new_value: str  # candidate transaction and the new value
+    channel: str, user_id: str, text: str, session: dict, new_value: str  # candidate transaction and the new value
 ) -> list[str]:
-    key = state_key(channel, user_id)
-    matches = state_info.get("matches", [])  # the candidate transaction (always a single item in this flow)
+    matches = session.get("matches", [])  # the candidate transaction (always a single item in this flow)
     match = matches[0] if matches else None  # the transaction being proposed
     normalized = normalize_reply(text)  # normalize the reply for matching
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # option 1: confirm both the transaction and new value
         updated_row, updates = apply_correction(match, new_value)  # apply the stored new value, as in State E
-        user_states.pop(key, None)  # correction flow is complete, return this user to State A
+        finish(session)  # correction flow is complete, return this user to State A
         return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
     if normalized == "2" or normalized == "otro valor":  # option 2: right transaction, wrong proposed new value
-        user_states[key] = {"state": "E", "match": match}  # move to State E awaiting a fresh new value
+        transition(session, {"state": "E", "match": match})  # move to State E awaiting a fresh new value
         return [NEW_VALUE_PROMPT]  # ask for the new value, description, or recurrence
 
     if normalized == "3" or normalized == "otra":  # option 3: this isn't the right transaction at all
-        user_states[key] = {  # move to State C to ask for the time window, clearing the stored new value
+        transition(session, {  # move to State C to ask for the time window, clearing the stored new value
             "state": "C",  # State C: awaiting the time window
-            "correction_hint": state_info.get("correction_hint"),  # keep the original hint from classification
+            "correction_hint": session.get("correction_hint"),  # keep the original hint from classification
             "date_range": None,  # no date range chosen yet
-        }
+        })
         return [TIME_WINDOW_QUESTION]  # ask the user when the transaction happened
 
     return ["No entendí tu respuesta. Responde 1 (sí), 2 (otro valor), o 3 (otra)."]  # still State D
 
 
-def handle_state_e(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # the new-value reply
-    key = state_key(channel, user_id)
-    match = state_info.get("match")  # the transaction row selected for correction in State D
+def handle_state_e(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # the new-value reply
+    match = session.get("match")  # the transaction row selected for correction in State D
 
     if is_cancellation(text):  # check deterministically whether the user wants to abandon the correction
-        user_states[key] = {"state": "E_CANCEL", "match": match}  # move to the sub-state asking what to cancel
+        transition(session, {"state": "E_CANCEL", "match": match})  # move to the sub-state asking what to cancel
         return [CANCEL_SCOPE_QUESTION]  # ask whether to cancel just the correction or the whole transaction
 
     normalized = normalize_reply(text)  # normalize the reply for menu lookups
     if normalized in FIELD_MENU:  # user picked "1. el monto" or "2. la descripción" — needs a follow-up value
-        user_states[key] = {"state": "E", "match": match, "field": FIELD_MENU[normalized]}  # stay in E, remember field
+        transition(session, {"state": "E", "match": match, "field": FIELD_MENU[normalized]})  # stay in E, remember field
         return [  # ask specifically for that field's value
             "¿Cuál es el nuevo monto?" if FIELD_MENU[normalized] == "amount" else "¿Cuál es la nueva descripción?"
         ]
 
     if normalized in VALUE_MENU:  # user picked a menu option that is itself a complete value (frequency/category)
         updated_row, updates = apply_correction(match, VALUE_MENU[normalized])  # apply the chosen value directly
-        user_states.pop(key, None)  # correction flow is complete, return this user to State A
+        finish(session)  # correction flow is complete, return this user to State A
         return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
     if references_frequency_without_value(text):  # user named the concept (e.g. "frecuencia") but no specific value
-        user_states[key] = {"state": "E_FREQUENCY", "match": match}  # wait for the specific value, don't guess
+        transition(session, {"state": "E_FREQUENCY", "match": match})  # wait for the specific value, don't guess
         return [FREQUENCY_QUESTION]  # ask exactly which frequency they mean
 
     if references_category_without_value(text):  # user named the concept (e.g. "categoría") but no specific value
-        user_states[key] = {"state": "E_CATEGORY", "match": match}  # wait for the specific value, don't guess
+        transition(session, {"state": "E_CATEGORY", "match": match})  # wait for the specific value, don't guess
         return [CATEGORY_QUESTION]  # ask exactly which category they mean
 
-    field = state_info.get("field")  # a prior FIELD_MENU choice ("amount"/"description") awaiting this value, if any
+    field = session.get("field")  # a prior FIELD_MENU choice ("amount"/"description") awaiting this value, if any
     if field == "amount":  # user is answering "¿Cuál es el nuevo monto?"
         parsed_amount = extract_amount_from_text(text)  # find a numeric amount among the words
         if parsed_amount is None:  # no recognizable number given
@@ -1082,28 +1102,27 @@ def handle_state_e(channel: str, user_id: str, text: str, state_info: dict) -> l
         updated_row, updates = db.save_correction(match, {"amount": parsed_amount}, text)  # apply the amount only,
         # the description is left untouched here — auto-regenerating it would silently discard useful detail
         # (e.g. "leche y harina" becoming a generic "Gasto de X pesos."), so ask the user instead of guessing.
-        user_states[key] = {"state": "E_DESCRIPTION_ASK", "match": updated_row}  # offer to also fix the description
+        transition(session, {"state": "E_DESCRIPTION_ASK", "match": updated_row})  # offer to also fix the description
         # Two separate messages, exactly as before: the confirmation, then the follow-up question.
         return [build_correction_confirmation(updated_row, updates), DESCRIPTION_FOLLOWUP_QUESTION]
     if field == "description":  # user is answering "¿Cuál es la nueva descripción?"
         updated_row, updates = db.save_correction(match, {"description": text.strip()}, text)  # apply the description
-        user_states.pop(key, None)  # correction flow is complete, return this user to State A
+        finish(session)  # correction flow is complete, return this user to State A
         return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
     # State E is purely deterministic: any non-cancellation, non-ambiguous reply is treated directly as the new
     # value, with no Claude call, to avoid the interrupt/clarification loop that could get stuck asking forever.
     updated_row, updates = apply_correction(match, text)  # apply the new value and get back the updated row
-    user_states.pop(key, None)  # correction flow is complete, return this user to State A
+    finish(session)  # correction flow is complete, return this user to State A
     return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
 
-def handle_state_e_frequency(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a specific
-    key = state_key(channel, user_id)  # frequency reply — the transaction row selected for correction in State D
-    match = state_info.get("match")
+def handle_state_e_frequency(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a specific
+    match = session.get("match")
     normalized = normalize_reply(text)  # normalize the reply for matching
 
     if is_cancellation(text):  # user wants to abandon the correction after all
-        user_states[key] = {"state": "E_CANCEL", "match": match}  # move to the sub-state asking what to cancel
+        transition(session, {"state": "E_CANCEL", "match": match})  # move to the sub-state asking what to cancel
         return [CANCEL_SCOPE_QUESTION]  # ask whether to cancel just the correction or the whole transaction
 
     chosen = FREQUENCY_MENU.get(normalized) or extract_recurrence_from_text(text)  # a menu number or the word
@@ -1111,17 +1130,16 @@ def handle_state_e_frequency(channel: str, user_id: str, text: str, state_info: 
         return [FREQUENCY_RETRY]  # ask again, stay in State E_FREQUENCY
 
     updated_row, updates = apply_correction(match, chosen)  # apply the now-confirmed frequency value
-    user_states.pop(key, None)  # correction flow is complete, return this user to State A
+    finish(session)  # correction flow is complete, return this user to State A
     return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
 
-def handle_state_e_category(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a specific
-    key = state_key(channel, user_id)  # category reply — the transaction row selected for correction in State D
-    match = state_info.get("match")
+def handle_state_e_category(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a specific
+    match = session.get("match")
     normalized = normalize_reply(text)  # normalize the reply for matching
 
     if is_cancellation(text):  # user wants to abandon the correction after all
-        user_states[key] = {"state": "E_CANCEL", "match": match}  # move to the sub-state asking what to cancel
+        transition(session, {"state": "E_CANCEL", "match": match})  # move to the sub-state asking what to cancel
         return [CANCEL_SCOPE_QUESTION]  # ask whether to cancel just the correction or the whole transaction
 
     chosen = CATEGORY_MENU.get(normalized) or extract_category_from_text(text)  # a menu number or the word
@@ -1129,86 +1147,81 @@ def handle_state_e_category(channel: str, user_id: str, text: str, state_info: d
         return [CATEGORY_RETRY]  # ask again, stay in State E_CATEGORY
 
     updated_row, updates = apply_correction(match, chosen)  # apply the now-confirmed category value
-    user_states.pop(key, None)  # correction flow is complete, return this user to State A
+    finish(session)  # correction flow is complete, return this user to State A
     return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
 
-def handle_state_e_description_ask(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # yes/no to
-    key = state_key(channel, user_id)  # "also update the description?" after an amount-only correction
-    match = state_info.get("match")
+def handle_state_e_description_ask(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # yes/no to
+    match = session.get("match")
     normalized = normalize_reply(text)  # normalize the reply for matching
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # user wants to update the description too
-        user_states[key] = {"state": "E_DESCRIPTION_VALUE", "match": match}  # wait for the new description text
+        transition(session, {"state": "E_DESCRIPTION_VALUE", "match": match})  # wait for the new description text
         return ["¿Cuál es la nueva descripción?"]  # ask for it
 
     if normalized == "2" or normalized in NEGATIVE_REPLIES:  # user is fine leaving the description as-is
-        user_states.pop(key, None)  # correction flow is complete, return this user to State A
+        finish(session)  # correction flow is complete, return this user to State A
         return ["Listo, la descripción queda igual ✅"]  # confirm nothing else changed
 
     return [DESCRIPTION_FOLLOWUP_RETRY]  # unrecognized reply, ask again; state is left unchanged
 
 
-def handle_state_e_description_value(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # the new
-    key = state_key(channel, user_id)  # description text after the user opted to also update it
-    match = state_info.get("match")
+def handle_state_e_description_value(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # the new
+    match = session.get("match")
     updated_row, updates = db.save_correction(match, {"description": text.strip()}, text)  # apply the description
-    user_states.pop(key, None)  # correction flow is complete, return this user to State A
+    finish(session)  # correction flow is complete, return this user to State A
     return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
 
-def handle_state_e_cancel(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # cancel-scope reply
-    key = state_key(channel, user_id)
-    match = state_info.get("match")  # the transaction that was being corrected
+def handle_state_e_cancel(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # cancel-scope reply
+    match = session.get("match")  # the transaction that was being corrected
     normalized = normalize_reply(text)  # normalize the reply for simple keyword matching
 
     if normalized == "1" or "correccion" in normalized:  # de-accented, so "corrección" matches too
         db.reactivate_transaction(match["id"])  # restore status
-        user_states.pop(key, None)  # correction is abandoned, return this user to State A
+        finish(session)  # correction is abandoned, return this user to State A
         return ["Listo, cancelé la corrección. La transacción original quedó sin cambios ✅"]
 
     if normalized == "2" or "transaccion" in normalized:  # de-accented, so "transacción" matches too
         db.void_transaction(match["id"])  # mark the transaction as void
-        user_states.pop(key, None)  # transaction is void, return this user to State A
+        finish(session)  # transaction is void, return this user to State A
         return ["Listo, anulé la transacción ✅"]  # confirm the transaction was voided
 
     return ["No entendí. Responde 1 (la corrección) o 2 (la transacción)."]  # still E_CANCEL
 
 
-def handle_state_r(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a report follow-up reply
-    key = state_key(channel, user_id)
+def handle_state_r(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a report follow-up reply
     normalized = normalize_reply(text)  # normalize the reply for matching
     today = today_local()  # reference date for "semana"/"mes"
 
     if normalized == "1" or "esta semana" in normalized:  # option 1: show this week's report instead
         start = week_start(today)  # Monday of the current week
-        return send_period_report(channel, user_id, start, today, f"Resumen de esta semana — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
+        return send_period_report(channel, user_id, session, start, today, f"Resumen de esta semana — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
     if normalized == "2" or "este mes" in normalized:  # option 2: show this month's report instead
         start = today.replace(day=1)  # first day of the current month
-        return send_period_report(channel, user_id, start, today, f"Resumen de este mes — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
+        return send_period_report(channel, user_id, session, start, today, f"Resumen de este mes — {start:%d/%m/%Y} al {today:%d/%m/%Y}")
     if normalized == "3" or "otra fecha" in normalized:  # option 3: ask for a custom start date
-        user_states[key] = {"state": "R_DATE"}  # await the free-text date expression
+        transition(session, {"state": "R_DATE"})  # await the free-text date expression
         return [R_DATE_QUESTION]  # ask since when
     if normalized == "4" or normalized in NEGATIVE_REPLIES or "no, gracias" in normalized or "no gracias" in normalized:
         # option 4, or any other decline — exit cleanly, no need to reclassify a bare "no"/"4" through Claude
-        user_states.pop(key, None)  # return to State A
+        finish(session)  # return to State A
         return ["OK✅"]  # confirm the decline was understood
-    user_states.pop(key, None)  # any other message is unrelated to this menu — drop the follow-up
-    return handle_state_a(channel, user_id, text)  # classify and handle this message normally
+    finish(session)  # any other message is unrelated to this menu — drop the follow-up
+    return handle_state_a(channel, user_id, text, session)  # classify and handle this message normally
 
 
-def handle_state_r_date(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # the free-text
-    key = state_key(channel, user_id)  # date-expression reply to "¿Desde cuándo?", via Claude
+def handle_state_r_date(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # the free-text
     parsed = parse_date_expression(text)
     today = today_local()  # end of the report range is always today
     if parsed is not None:  # Claude confidently parsed a start date
         header = f"Resumen desde {parsed:%d/%m/%Y} al {today:%d/%m/%Y}"  # date-range header
-        return send_period_report(channel, user_id, parsed, today, header)  # show the report
-    user_states[key] = {"state": "R_DATE_MANUAL"}  # await a DD/MM/YYYY reply
+        return send_period_report(channel, user_id, session, parsed, today, header)  # show the report
+    transition(session, {"state": "R_DATE_MANUAL"})  # await a DD/MM/YYYY reply
     return [R_DATE_MANUAL_QUESTION]  # ask for the manual format
 
 
-def handle_state_r_date_manual(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # a DD/MM/YYYY
+def handle_state_r_date_manual(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # a DD/MM/YYYY
     today = today_local()  # reply; end of the report range is always today
     try:  # parse the manual date format directly, no Claude call needed
         parsed = datetime.strptime(text.strip(), "%d/%m/%Y").date()  # exact DD/MM/YYYY format
@@ -1216,22 +1229,21 @@ def handle_state_r_date_manual(channel: str, user_id: str, text: str, state_info
         return [R_DATE_MANUAL_RETRY]  # ask again, stay in State R_DATE_MANUAL
 
     header = f"Resumen desde {parsed:%d/%m/%Y} al {today:%d/%m/%Y}"  # date-range header
-    return send_period_report(channel, user_id, parsed, today, header)  # show the report
+    return send_period_report(channel, user_id, session, parsed, today, header)  # show the report
 
 
-def handle_state_r_debtors_followup(channel: str, user_id: str, text: str, state_info: dict) -> list[str]:  # sí/no to
-    key = state_key(channel, user_id)  # "¿Quieres ver la lista de acreedores también?"
+def handle_state_r_debtors_followup(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # sí/no to
     normalized = normalize_reply(text)
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # user wants to see the creditor list too
-        return send_creditor_list(channel, user_id)  # show it
+        return send_creditor_list(channel, user_id, session)  # show it
     if normalized == "2" or normalized in NEGATIVE_REPLIES:  # user is done with reports
-        user_states.pop(key, None)  # return to State A
+        finish(session)  # return to State A
         return ["OK✅"]  # confirm the decline was understood
-    user_states.pop(key, None)  # unrelated message, drop the follow-up and process it as a new message
-    return handle_state_a(channel, user_id, text)  # classify and handle this message normally
+    finish(session)  # unrelated message, drop the follow-up and process it as a new message
+    return handle_state_a(channel, user_id, text, session)  # classify and handle this message normally
 
 
-# Dispatch table: state name -> handler. Every handler takes (channel, user_id, text, state_info) and returns list[str].
+# Dispatch table: state name -> handler. Every handler takes (channel, user_id, text, session) and returns list[str].
 STATE_HANDLERS = {
     "B": handle_state_b,  # user is answering a clarification question
     "C": handle_state_c,  # user is specifying the time window for a correction
@@ -1253,33 +1265,40 @@ STATE_HANDLERS = {
 def handle_incoming_message(channel: str, user_id: str, text: str) -> list[str]:  # THE entry point for any channel.
     # Typed messages and transcribed voice notes both land here, so a voice note is treated exactly like the same
     # words typed — including mid-flow replies ("sí" in State D confirms, it does not start a new transaction).
-    key = state_key(channel, user_id)
+    #
+    # State is loaded from Supabase here and written back at the end, so a restart mid-flow loses nothing and two
+    # channel processes never disagree about where a user is.
     text = text.strip()  # the message text with surrounding whitespace removed
 
-    stale_state = user_states.get(key)  # the flow this user was in, if any (absent means they're in State A)
-    if stale_state is not None and state_is_expired(stale_state):  # they left a flow hanging for over an hour
-        user_states.pop(key, None)  # abandon it and return them to State A
-        return [STATE_EXPIRED_MESSAGE]  # the triggering message is discarded; their NEXT message starts fresh
-        # State A needs no notice, and that's automatic: a user already in State A has no entry to expire.
+    stored = db.get_user_state(channel, user_id)  # {"state", "state_data", "updated_at"} straight from Supabase
+    state = stored["state"]  # the state name this user was left in
 
-    state_info = user_states.get(key, {"state": "A"})  # look up this user's state, defaulting to State A
-    state = state_info.get("state", "A")  # extract the state name, defaulting to State A
+    if state_is_expired(state, stored["updated_at"]):  # they left a flow hanging for over an hour
+        db.clear_user_state(channel, user_id)  # abandon it and return them to State A
+        return [STATE_EXPIRED_MESSAGE]  # the triggering message is discarded; their NEXT message starts fresh
+        # State A needs no notice, and state_is_expired() returns False for it, so this branch can't fire there.
+
+    session = {"state": state, **deserialize_state_data(stored["state_data"])}  # the working copy handlers mutate
 
     try:  # guard the whole dispatch so a single failure doesn't crash the bot
         handler = STATE_HANDLERS.get(state)  # find the handler for this state, if any
         if handler is not None:  # a conversation flow is in progress
-            replies = handler(channel, user_id, text, state_info)  # delegate to that state's handler
+            replies = handler(channel, user_id, text, session)  # delegate to that state's handler
         else:  # default: no conversation flow in progress
-            replies = handle_state_a(channel, user_id, text)  # delegate to the State A handler
+            replies = handle_state_a(channel, user_id, text, session)  # delegate to the State A handler
     except Exception:  # catch any unexpected failure from the handlers above
         logger.exception("Failed to process message in state %s", state)  # log the full traceback for debugging
-        user_states.pop(key, None)  # reset this user's state so they aren't stuck in a broken flow
+        finish(session)  # reset this user's state so they aren't stuck in a broken flow
         replies = ["Hubo un error al procesar tu mensaje. Intenta de nuevo."]  # tell the user
 
-    # Stamp whatever state the handler left behind. Every state change happens inside the dispatch above, so this
-    # single line keeps last_updated current for all of them — no per-assignment bookkeeping scattered across handlers.
-    if key in user_states:  # the user is still mid-flow (a completed flow popped its state and needs no stamp)
-        user_states[key]["last_updated"] = datetime.now(timezone.utc)  # restart the 60-minute idle clock
+    # Persist whatever state the handler left behind. Every state change happens inside the dispatch above, so this
+    # one write covers all of them — and it refreshes updated_at, restarting the 60-minute idle clock.
+    new_state = session.get("state", "A")  # where the flow ended up
+    if new_state == "A":  # the flow completed (or never started) — nothing worth keeping
+        if state != "A":  # only write when there was actually something to clear, saving a round trip
+            db.clear_user_state(channel, user_id)
+    else:  # the user is still mid-flow, save the working data for the next message
+        db.save_user_state(channel, user_id, new_state, serialize_state_data(session))
 
     return replies
 
@@ -1306,7 +1325,7 @@ def handle_incoming_voice(  # transcribe a voice note, then process it exactly l
 ) -> list[str]:
     text = transcribe_voice(audio_bytes, mime_type)  # convert the audio to text via Whisper
     if text is None:  # transcription failed or produced nothing usable
-        user_states.pop(state_key(channel, user_id), None)  # return this user to State A, as specified
+        db.clear_user_state(channel, user_id)  # return this user to State A, as specified
         return [VOICE_TRANSCRIPTION_ERROR]  # ask the user to type it instead
 
     logger.info("Voice note from %s/%s transcribed as: %r", channel, user_id, text)  # surface it in the log
