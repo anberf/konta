@@ -300,6 +300,65 @@ def clear_user_state(channel: str, user_id: str) -> None:  # return this user to
     save_user_state(channel, user_id, "A", {})  # keep the row, reset its contents
 
 
+# --------------------------------------------------------------------------------------------------
+# Abuse guards: private-beta allowlist, single-use invite codes, per-user daily quotas.
+# --------------------------------------------------------------------------------------------------
+
+def is_allowed_user(channel: str, user_id: str) -> bool:  # may this person use the bot at all?
+    result = _scoped(supabase.table("allowed_users").select("user_id"), channel, user_id).limit(1).execute()
+    return bool(result.data)  # a row here is the allowlist entry; absent means blocked
+
+
+def add_allowed_user(channel: str, user_id: str, code_used: str | None) -> None:  # admit someone to the beta
+    supabase.table("allowed_users").upsert(  # upsert so re-admitting an existing user is harmless
+        {"channel": channel, "user_id": str(user_id), "code_used": code_used},
+        on_conflict="channel,user_id",  # the primary key
+    ).execute()
+
+
+def redeem_code(code: str, channel: str, user_id: str) -> str:  # "redeemed" | "already_used" | "not_found"
+    # The update is conditional on redeemed_at still being NULL, so the database itself decides the winner:
+    # if two people send the same code at the same instant, exactly one update matches a row.
+    claimed = (
+        supabase.table("access_codes")
+        .update({"redeemed_by_channel": channel, "redeemed_by_user_id": str(user_id), "redeemed_at": now_iso()})
+        .eq("code", code)  # this specific code
+        .is_("redeemed_at", "null")  # ...but only while it is still unredeemed
+        .execute()
+    )
+    if claimed.data:  # our update matched a row, so this caller won the race
+        return "redeemed"
+    exists = supabase.table("access_codes").select("code").eq("code", code).limit(1).execute()
+    return "already_used" if exists.data else "not_found"  # distinguish a spent code from a wrong one
+
+
+def get_usage(channel: str, user_id: str, usage_date) -> dict:  # today's message counts for this user
+    result = (
+        _scoped(supabase.table("usage_counters").select("text_count,voice_count"), channel, user_id)
+        .eq("usage_date", usage_date.isoformat())  # the Europe/Amsterdam calendar date
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []  # no row yet means nothing has been counted today
+    if not rows:
+        return {"text_count": 0, "voice_count": 0}
+    return {"text_count": rows[0].get("text_count") or 0, "voice_count": rows[0].get("voice_count") or 0}
+
+
+def increment_usage(channel: str, user_id: str, usage_date, kind: str) -> None:  # kind is "text" or "voice"
+    # Read-then-upsert. A user would have to send two messages in the same instant to lose a count, and the
+    # worst case is one message not counted against their own daily quota — acceptable for a rate limit.
+    current = get_usage(channel, user_id, usage_date)  # what has been counted so far today
+    counts = {
+        "text_count": current["text_count"] + (1 if kind == "text" else 0),
+        "voice_count": current["voice_count"] + (1 if kind == "voice" else 0),
+    }
+    supabase.table("usage_counters").upsert(
+        {"channel": channel, "user_id": str(user_id), "usage_date": usage_date.isoformat(), **counts},
+        on_conflict="channel,user_id,usage_date",  # the primary key
+    ).execute()
+
+
 def void_transaction(transaction_id) -> None:  # mark one transaction as voided ("anulada")
     supabase.table("transactions").update(  # void that transaction
         {"status": "anulada", "updated_at": now_iso()}  # mark it voided and refresh the update timestamp

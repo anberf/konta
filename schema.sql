@@ -68,6 +68,77 @@ create policy "bot can insert user_state" on public.user_state
 create policy "bot can update user_state" on public.user_state
     for update to anon using (true) with check (true);
 
+-- ---------------------------------------------------------------------------
+-- Abuse guards: private-beta allowlist, single-use invite codes, daily quotas.
+-- ---------------------------------------------------------------------------
+
+-- One row per invite code. redeemed_at IS NULL means the code is still available;
+-- redemption is a conditional update on that column, so two people sending the
+-- same code at the same time cannot both win.
+create table if not exists access_codes (
+    code text primary key,
+    label text,
+    redeemed_by_channel text,
+    redeemed_by_user_id text,
+    redeemed_at timestamp,
+    created_at timestamp default now()
+);
+
+-- Who may use the bot at all. A (channel, user_id) absent from here is blocked.
+create table if not exists allowed_users (
+    channel text not null,
+    user_id text not null,
+    code_used text,
+    created_at timestamp default now(),
+    primary key (channel, user_id)
+);
+
+-- Per-user daily message counts. usage_date is the Europe/Amsterdam calendar
+-- date, matching the timezone the reports already use.
+create table if not exists usage_counters (
+    channel text not null,
+    user_id text not null,
+    usage_date date not null,
+    text_count integer default 0,
+    voice_count integer default 0,
+    primary key (channel, user_id, usage_date)
+);
+
+-- Same grant/RLS pattern as user_state: read, insert and update for anon; never delete.
+grant select, insert, update on public.access_codes to anon;
+grant select, insert, update on public.allowed_users to anon;
+grant select, insert, update on public.usage_counters to anon;
+
+alter table public.access_codes enable row level security;
+alter table public.allowed_users enable row level security;
+alter table public.usage_counters enable row level security;
+
+create policy "bot can select access_codes" on public.access_codes
+    for select to anon using (true);
+create policy "bot can insert access_codes" on public.access_codes
+    for insert to anon with check (true);
+create policy "bot can update access_codes" on public.access_codes
+    for update to anon using (true) with check (true);
+
+create policy "bot can select allowed_users" on public.allowed_users
+    for select to anon using (true);
+create policy "bot can insert allowed_users" on public.allowed_users
+    for insert to anon with check (true);
+create policy "bot can update allowed_users" on public.allowed_users
+    for update to anon using (true) with check (true);
+
+create policy "bot can select usage_counters" on public.usage_counters
+    for select to anon using (true);
+create policy "bot can insert usage_counters" on public.usage_counters
+    for insert to anon with check (true);
+create policy "bot can update usage_counters" on public.usage_counters
+    for update to anon using (true) with check (true);
+
+-- The existing Telegram vendor, seeded so enabling the allowlist cannot lock them out.
+insert into allowed_users (channel, user_id, code_used)
+values ('telegram', '7960646753', 'seed-existing-user')
+on conflict (channel, user_id) do nothing;
+
 -- Period index for faster report queries
 create index if not exists idx_transactions_user_created
     on transactions(user_id, created_at, status);

@@ -63,6 +63,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info("Skipping duplicate voice message_id %s in chat %s", message.message_id, message.chat_id)
         return  # skip silently: no reply, no Supabase writes, no state change
 
+    user_id = str(update.effective_user.id)  # who sent it, used for the allowlist and quota checks
+    duration = message.voice.duration  # seconds, reported by Telegram; core rejects over-long notes before Whisper
+
+    # Ask core first, passing the duration but no audio. If the user is blocked, over quota, or the note is too
+    # long, core answers without needing the bytes — so we skip the download entirely rather than paying for it.
+    gate = core.check_voice_allowed(CHANNEL, user_id, duration)
+    if gate is not None:  # blocked, rate-limited or too long
+        await send_all(message, gate)  # tell them why
+        return  # no download, no Whisper call
+
     try:  # downloading from Telegram can fail independently of transcription
         voice_file = await context.bot.get_file(message.voice.file_id)  # resolve the file ID to a downloadable file
         audio_buffer = await voice_file.download_as_bytearray()  # pull the .ogg bytes into memory, no temp file needed
@@ -72,7 +82,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return  # stop here, leaving the user's state untouched (State A stays State A)
 
     replies = core.handle_incoming_voice(  # transcribe, then run the same dispatch a typed message takes
-        CHANNEL, str(update.effective_user.id), bytes(audio_buffer), "audio/ogg"
+        CHANNEL, user_id, bytes(audio_buffer), "audio/ogg", duration
     )
     await send_all(message, replies)  # send whatever core decided to say
 

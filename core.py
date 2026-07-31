@@ -1262,12 +1262,15 @@ STATE_HANDLERS = {
 }
 
 
-def handle_incoming_message(channel: str, user_id: str, text: str) -> list[str]:  # THE entry point for any channel.
+def run_state_machine(channel: str, user_id: str, text: str) -> list[str]:  # load state -> dispatch -> save state.
     # Typed messages and transcribed voice notes both land here, so a voice note is treated exactly like the same
     # words typed — including mid-flow replies ("sí" in State D confirms, it does not start a new transaction).
     #
     # State is loaded from Supabase here and written back at the end, so a restart mid-flow loses nothing and two
     # channel processes never disagree about where a user is.
+    #
+    # The abuse guards live in the two public entry points below, not here, so a voice note passes the gate and is
+    # counted exactly once rather than being billed as both a voice note and a text message.
     text = text.strip()  # the message text with surrounding whitespace removed
 
     stored = db.get_user_state(channel, user_id)  # {"state", "state_data", "updated_at"} straight from Supabase
@@ -1303,6 +1306,60 @@ def handle_incoming_message(channel: str, user_id: str, text: str) -> list[str]:
     return replies
 
 
+# --------------------------------------------------------------------------------------------------
+# Abuse guards, applied before any Claude/Whisper call so a stranger can never spend money.
+# --------------------------------------------------------------------------------------------------
+
+ACCESS_REQUIRED_MESSAGE = "Konta está en pruebas privadas. Si tienes un código de acceso, escríbelo aquí."
+CODE_ALREADY_USED_MESSAGE = "Ese código ya fue usado. Pide uno nuevo a quien te invitó."
+CODE_ACCEPTED_MESSAGE = "¡Bienvenido a Konta! ✅"
+
+TEXT_DAILY_LIMIT = 500  # messages per user per day
+VOICE_DAILY_LIMIT = 50  # voice notes per user per day
+VOICE_MAX_SECONDS = 60  # anything longer is rejected before it reaches Whisper
+
+TEXT_LIMIT_MESSAGE = "Llegaste al límite de mensajes por hoy. Vuelve mañana 👍"
+VOICE_LIMIT_MESSAGE = "Llegaste al límite de notas de voz por hoy. Puedes seguir escribiendo 👍"
+VOICE_TOO_LONG_MESSAGE = "Esa nota de voz es muy larga. Mándame una más corta, de menos de un minuto 🙏"
+
+
+def normalize_code(text: str) -> str:  # invite codes are matched case-insensitively, ignoring stray whitespace
+    return text.strip().upper()  # "  konta-a1b2 " -> "KONTA-A1B2"
+
+
+def try_redeem_access(channel: str, user_id: str, text: str) -> list[str]:  # a non-allowlisted user's text is
+    code = normalize_code(text)  # treated as a possible invite code
+    outcome = db.redeem_code(code, channel, user_id)  # atomic: only one caller can claim a given code
+
+    if outcome == "redeemed":  # valid and unused — admit them
+        db.add_allowed_user(channel, user_id, code)  # they are now on the allowlist for good
+        logger.info("Access code %s redeemed by %s/%s", code, channel, user_id)
+        return [CODE_ACCEPTED_MESSAGE, *welcome_messages()]  # greeting, then the usual welcome + examples
+    if outcome == "already_used":  # the code exists but somebody got there first
+        return [CODE_ALREADY_USED_MESSAGE]
+    return [ACCESS_REQUIRED_MESSAGE]  # not a code at all — explain the private beta
+
+
+def check_voice_allowed(channel: str, user_id: str, duration_seconds: int | None) -> list[str] | None:
+    # Every reason a voice note can be rejected, evaluated without the audio itself. A channel can call this
+    # first to skip downloading bytes it is only going to throw away; handle_incoming_voice repeats the same
+    # checks, so a channel that does not pre-check is still safe.
+    if not db.is_allowed_user(channel, user_id):  # not in the private beta
+        return [ACCESS_REQUIRED_MESSAGE]  # audio is never treated as a code, and never transcribed
+    if duration_seconds is not None and duration_seconds > VOICE_MAX_SECONDS:  # too long to be worth transcribing
+        return [VOICE_TOO_LONG_MESSAGE]
+    return check_daily_limit(channel, user_id, "voice")  # None when under the daily voice quota
+
+
+def check_daily_limit(channel: str, user_id: str, kind: str) -> list[str] | None:  # None means "under the limit"
+    usage = db.get_usage(channel, user_id, today_local())  # counts for the vendor's local calendar day
+    if kind == "text" and usage["text_count"] >= TEXT_DAILY_LIMIT:
+        return [TEXT_LIMIT_MESSAGE]
+    if kind == "voice" and usage["voice_count"] >= VOICE_DAILY_LIMIT:
+        return [VOICE_LIMIT_MESSAGE]
+    return None  # under the limit, carry on
+
+
 def transcribe_voice(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:  # voice note -> text via Whisper
     # Whisper accepts .ogg/opus directly, so no ffmpeg conversion is needed — the bytes go up exactly as downloaded.
     extension = mime_type.split("/")[-1] or "ogg"  # e.g. "audio/ogg" -> "ogg"; only used to name the upload
@@ -1320,16 +1377,38 @@ def transcribe_voice(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | 
     return text or None  # treat a blank transcription (silence, pure noise) as a failure too
 
 
+def handle_incoming_message(channel: str, user_id: str, text: str) -> list[str]:  # THE text entry point for any channel
+    if not db.is_allowed_user(channel, user_id):  # not in the private beta — their text may be an invite code
+        return try_redeem_access(channel, user_id, text)  # admits them, or explains why not; nothing else runs
+
+    limited = check_daily_limit(channel, user_id, "text")  # over quota for today?
+    if limited is not None:  # yes — stop before spending anything on Claude
+        return limited
+
+    replies = run_state_machine(channel, user_id, text)  # the message was accepted and processed
+    db.increment_usage(channel, user_id, today_local(), "text")  # count it only now that it actually ran
+    return replies
+
+
 def handle_incoming_voice(  # transcribe a voice note, then process it exactly like a typed message
-    channel: str, user_id: str, audio_bytes: bytes, mime_type: str = "audio/ogg"
+    channel: str, user_id: str, audio_bytes: bytes, mime_type: str = "audio/ogg",
+    duration_seconds: int | None = None,  # the channel supplies this; Telegram has it on message.voice.duration
 ) -> list[str]:
+    # Runs BEFORE transcribe_voice, so audio from a stranger — or an over-long note — never reaches Whisper and
+    # never costs anything, whether or not the channel already called check_voice_allowed itself.
+    blocked = check_voice_allowed(channel, user_id, duration_seconds)  # allowlist, length and quota in one call
+    if blocked is not None:  # any of the three rejected it
+        return blocked
+
     text = transcribe_voice(audio_bytes, mime_type)  # convert the audio to text via Whisper
     if text is None:  # transcription failed or produced nothing usable
         db.clear_user_state(channel, user_id)  # return this user to State A, as specified
         return [VOICE_TRANSCRIPTION_ERROR]  # ask the user to type it instead
 
     logger.info("Voice note from %s/%s transcribed as: %r", channel, user_id, text)  # surface it in the log
-    return handle_incoming_message(channel, user_id, text)  # hand off to the same dispatch a typed message takes
+    replies = run_state_machine(channel, user_id, text)  # same dispatch a typed message takes
+    db.increment_usage(channel, user_id, today_local(), "voice")  # counted as a voice note, not as text
+    return replies
 
 
 def welcome_messages() -> list[str]:  # the two messages a brand-new user sees, in order
