@@ -63,7 +63,8 @@ Return ONLY a JSON object with these fields:
 * clarification_question: simple Spanish question if needs_clarification is true, otherwise null
 * correction_hint: for a "correction" intent, this is ALWAYS the OLD value of the specific field being changed — the value that was originally registered and is now wrong. It is NEVER the new value the user just stated. Example: in "ah no fueron 24000", 24000 is the NEW value (goes in new_value below); correction_hint is whatever amount was previously registered, which you must infer from the conversation context. If you cannot determine the old value from context, set needs_clarification to true and set clarification_question to ask the user what the original value was. Null for all intents other than "correction".
 * transaction_keyword: for a "correction" or "cancellation" intent, a short keyword or phrase naming WHICH past transaction the user means, taken from what they're describing rather than the field they're changing — e.g. in "la luz debería ser recurrente" this is "luz" (not "recurrente", which is the new value, and not "única vez", which would be the old recurrence value); in "quiero eliminar la transacción de la luz" this is also "luz". Use a word that would plausibly appear in that transaction's description (e.g. "luz", "arepas", "Bryan"). Set to null if the user doesn't reference a specific transaction by description (e.g. "borra lo último", "no son 10000, son 20000" with no other context — these rely on the most recent transaction or the amount instead).
-* new_value: for a "correction" intent, the corrected value the user wants to apply — a new amount (e.g. "24000"), a new description (e.g. "gas para el negocio"), or a new recurrence category ("recurrente", "variable", or "única vez") if the user is correcting how often the transaction repeats (e.g. "la luz debería ser recurrente"). Null for all other intents.
+* new_field: for a "correction" intent, WHICH field the user is correcting — one of "amount", "description", "category", "type", "recurrence", or null if you cannot tell. Null for all other intents.
+* new_value: for a "correction" intent, the corrected value to store in that field. Match the field's allowed values exactly: a plain number for "amount"; free Spanish text for "description"; "negocio" or "personal" for "category"; "ingreso", "gasto", "préstamo", "deuda", "cobro" or "pago_deuda" for "type"; "única vez", "recurrente" or "variable" for "recurrence". Null for all other intents.
 * query_period: for a "query" intent, one of "hoy", "semana", "mes", "deudores", "acreedores", "custom", or null if unclear. "hoy" is asking about today/current status (e.g. "cómo voy", "cómo voy hoy", "cuánto tengo", "cuánto llevo", "resumen"). "semana" is asking about this week (e.g. "cómo voy esta semana"). "mes" is asking about this month (e.g. "cómo voy este mes"). "deudores" is asking who owes the vendor money (e.g. "quién me debe", "lista de deudores", "cuánto me deben"). "acreedores" is asking who the vendor owes money to (e.g. "a quién le debo", "lista de acreedores", "cuánto debo"). "custom" is when the user names a specific starting point (e.g. "desde el 10 de julio", "desde otra fecha") — also set query_date_hint. Null for all non-"query" intents.
 * query_date_hint: for a "query" intent with query_period "custom", the raw date expression the user gave (e.g. "el 10 de julio", "hace 2 semanas"). Null otherwise.
 
@@ -115,6 +116,18 @@ Query examples:
 * "como voy este mes" → intent: query, query_period: mes
 * "quien me debe" → intent: query, query_period: deudores
 * "a quien le debo" → intent: query, query_period: acreedores
+
+Corrections:
+A correction can target ANY field of the most recent transaction — amount, description, category (negocio/personal), type (ingreso/gasto/préstamo/deuda/cobro/pago_deuda), or recurrence. Read the user's message in context of the last transaction and determine which field they are correcting and what the new value should be. Do not require specific trigger phrases — infer intent from natural language.
+
+Put the field you identified in new_field and the corrected value in new_value.
+
+The following are illustrations of that reasoning, NOT an exhaustive list of phrases to match. Any natural way a vendor might express a correction should be understood, whether or not it resembles these:
+* "eso fue personal" → new_field: category, new_value: personal
+* "no fueron 20 sino 15 arepas" → new_field: description, new_value: "Venta de 15 arepas."
+* "fue un préstamo, no un gasto" → new_field: type, new_value: préstamo
+* "ah no, fueron 24000" → new_field: amount, new_value: 24000
+* "la luz se paga todos los meses" → new_field: recurrence, new_value: recurrente
 
 Rules:
 * A message asking about a balance, total, or who-owes-whom (e.g. "cómo voy", "cuánto tengo", "cuánto me deben") is always intent "query", never "new_transaction" — it names no amount/type to save, only a question about existing data.
@@ -541,6 +554,78 @@ def build_multi_match_prompt(candidates: list[dict], verb: str) -> str:  # numbe
     return "\n".join(lines) + f"\n¿Cuál es la que quieres {verb}? Responde con el número"  # ask which one
 
 
+# The five correctable fields, with the Spanish label used when confirming a change and the allowed values.
+CORRECTABLE_FIELDS = {
+    "amount": {"label": "el monto", "allowed": None},  # any number
+    "description": {"label": "la descripción", "allowed": None},  # any free text
+    "category": {"label": "la categoría", "allowed": {"negocio", "personal"}},
+    "type": {"label": "el tipo", "allowed": {"ingreso", "gasto", "préstamo", "deuda", "cobro", "pago_deuda"}},
+    "recurrence": {"label": "la frecuencia", "allowed": {"única vez", "recurrente", "variable"}},
+}
+
+
+def field_label(field: str) -> str:  # Spanish name of a field, for the confirmation question
+    spec = CORRECTABLE_FIELDS.get(field)
+    return spec["label"] if spec else "el valor"  # generic fallback if Claude named something unexpected
+
+
+def format_field_value(field: str, value) -> str:  # how a field's value is shown to the vendor
+    if field == "amount" and value is not None:  # amounts get Spanish thousands separators, like everywhere else
+        try:
+            return format_amount_es(float(value))
+        except (TypeError, ValueError):  # not numeric after all — show it as-is rather than crash
+            return str(value)
+    return "(vacío)" if value in (None, "") else str(value)  # empty fields read better than a bare "None"
+
+
+def coerce_field_value(field: str, value):  # validate/normalize what Claude proposed for a given field
+    if field == "amount":  # must be a number to be stored
+        parsed = try_parse_amount(str(value)) if value is not None else None
+        return parsed  # None means "not usable", the caller falls back
+    if field == "description":  # free text, kept exactly as written (accents and capitals included)
+        text = str(value).strip() if value is not None else ""
+        return text or None
+    allowed = CORRECTABLE_FIELDS.get(field, {}).get("allowed")  # category / type / recurrence are closed sets
+    if not allowed:
+        return None  # unknown field
+    normalized = normalize_reply(str(value)) if value is not None else ""  # accent/case-insensitive comparison
+    for option in allowed:  # match against the canonical values, which keep their accents
+        if normalize_reply(option) == normalized:
+            return option  # return the canonical spelling, not what the user typed
+    return None  # Claude proposed something outside the allowed set
+
+
+CHANGE_ANSWER_MENU = (  # the three ways to answer the "do you want to change X?" question
+    " Responde con el número o la palabra:\n1. sí\n2. no al valor\n3. no a la transacción"
+)
+
+
+def build_change_question(match: dict, field: str | None, new_value) -> str:  # the confirmation for any field
+    if field in CORRECTABLE_FIELDS:  # Claude named a field, so we can state the change precisely
+        current = format_field_value(field, match.get(field))  # what is stored today
+        proposed = format_field_value(field, new_value)  # what the user seems to want
+        return f"¿Y quieres cambiar {field_label(field)} de {current} a {proposed}?{CHANGE_ANSWER_MENU}"
+    # Claude could not identify the field — fall back to naming the value alone, as this flow did before.
+    return f"¿Y el nuevo valor es {new_value}?{CHANGE_ANSWER_MENU}"
+
+
+def apply_field_correction(match: dict, field: str, value) -> tuple[dict, dict] | None:  # apply one named field
+    coerced = coerce_field_value(field, value)  # validate against that field's allowed values
+    if coerced is None:  # unusable value for this field — caller decides what to do instead
+        return None
+    if field == "amount":  # amounts also refresh the generated description, as this flow has always done
+        field_updates = {
+            "amount": coerced,
+            "description": build_corrected_description(
+                match.get("type"), match.get("debtor_name"), coerced,
+                match.get("creditor_name"), match.get("category"),
+            ),
+        }
+    else:  # every other field is a single-column update, leaving amount and description untouched
+        field_updates = {field: coerced}
+    return db.save_correction(match, field_updates, str(value))
+
+
 def apply_correction(match: dict, new_value_text: str) -> tuple[dict, dict]:  # auto-detect which field changed, apply it
     parsed_amount = extract_amount_from_text(new_value_text)  # look for a numeric amount anywhere among the words
     parsed_recurrence = None if parsed_amount is not None else extract_recurrence_from_text(new_value_text)  # or a word
@@ -801,6 +886,7 @@ def handle_state_a(channel: str, user_id: str, text: str, session: dict) -> list
     if intent == "correction":  # the user wants to fix a past transaction
         hint = normalize_classification_value(classification.get("correction_hint"))  # the OLD field value, if named
         new_value = normalize_classification_value(classification.get("new_value"))  # the NEW value, as a string
+        new_field = normalize_classification_value(classification.get("new_field"))  # WHICH field Claude identified
         keyword = normalize_classification_value(  # a description keyword identifying WHICH transaction, if named
             classification.get("transaction_keyword")
         )
@@ -815,12 +901,12 @@ def handle_state_a(channel: str, user_id: str, text: str, session: dict) -> list
                 "correction_hint": hint,  # keep the original hint in case the user rejects this candidate
                 "from_shortcut": True,  # mark this D state as reached via the last-transaction shortcut
                 "new_value": new_value,  # the new value to apply immediately if the user confirms both
+                "new_field": new_field,  # which field it belongs to, so the change can be described precisely
                 "action": "correct",  # this confirmation leads to a correction, not a deletion
             })
-            return [  # show the transaction, the proposed new value, and ask for confirmation
+            return [  # show the transaction, the proposed change, and ask for confirmation
                 f"¿Te refieres a esta transacción? {format_transaction(candidate)}\n"
-                f"¿Y el nuevo valor es {new_value}? Responde con el número o la palabra:\n"
-                "1. sí\n2. otro valor\n3. otra"
+                f"{build_change_question(candidate, new_field, new_value)}"
             ]
         if len(candidates) == 1:  # exactly one candidate, but no new value was extracted yet
             candidate = candidates[0]  # the single candidate transaction
@@ -1048,15 +1134,21 @@ def handle_state_d_with_new_value(  # handle the three-way reply when Claude alr
     normalized = normalize_reply(text)  # normalize the reply for matching
 
     if normalized == "1" or normalized in AFFIRMATIVE_REPLIES:  # option 1: confirm both the transaction and new value
-        updated_row, updates = apply_correction(match, new_value)  # apply the stored new value, as in State E
+        new_field = session.get("new_field")  # the field Claude identified, when it managed to
+        applied = apply_field_correction(match, new_field, new_value) if new_field else None  # write that field
+        if applied is None:  # no field named, or the value did not fit it — fall back to auto-detection
+            applied = apply_correction(match, new_value)  # the original behaviour, unchanged
+        updated_row, updates = applied
         finish(session)  # correction flow is complete, return this user to State A
         return [build_correction_confirmation(updated_row, updates)]  # confirm the correction
 
-    if normalized == "2" or normalized == "otro valor":  # option 2: right transaction, wrong proposed new value
+    # option 2: right transaction, wrong proposed value ("otro valor" kept so older phrasing still works)
+    if normalized == "2" or normalized in ("otro valor", "no al valor"):
         transition(session, {"state": "E", "match": match})  # move to State E awaiting a fresh new value
         return [NEW_VALUE_PROMPT]  # ask for the new value, description, or recurrence
 
-    if normalized == "3" or normalized == "otra":  # option 3: this isn't the right transaction at all
+    # option 3: this isn't the right transaction at all ("otra" kept so older phrasing still works)
+    if normalized == "3" or normalized in ("otra", "no a la transaccion"):
         transition(session, {  # move to State C to ask for the time window, clearing the stored new value
             "state": "C",  # State C: awaiting the time window
             "correction_hint": session.get("correction_hint"),  # keep the original hint from classification
@@ -1064,7 +1156,7 @@ def handle_state_d_with_new_value(  # handle the three-way reply when Claude alr
         })
         return [TIME_WINDOW_QUESTION]  # ask the user when the transaction happened
 
-    return ["No entendí tu respuesta. Responde 1 (sí), 2 (otro valor), o 3 (otra)."]  # still State D
+    return ["No entendí tu respuesta. Responde 1 (sí), 2 (no al valor), o 3 (no a la transacción)."]  # still State D
 
 
 def handle_state_e(channel: str, user_id: str, text: str, session: dict) -> list[str]:  # the new-value reply
